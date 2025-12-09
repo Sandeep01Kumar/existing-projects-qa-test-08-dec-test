@@ -9,6 +9,12 @@ const server = http.createServer((req, res) => {
   res.end('Hello, World!\n');
 });
 
-server.listen(port, hostname, () => {
-  console.log(`Server running at http://${hostname}:${port}/`);
-});
+// Only start server if this module is run directly (not required by tests)
+if (require.main === module) {
+  server.listen(port, hostname, () => {
+    console.log(`Server running at http://${hostname}:${port}/`);
+  });
+}
+
+// Export server instance and configuration for testing
+module.exports = { server, hostname, port };
