@@ -28,9 +28,15 @@ describe('Server Response Validation', () => {
   /**
    * Close server after all tests complete to prevent open handles.
    * This ensures proper cleanup of resources and allows Jest to exit cleanly.
+   * Note: Only close if server is listening to avoid "Server is not running" errors
+   * Jest's forceExit config will handle cleanup if server isn't listening
    */
   afterAll((done) => {
-    server.close(done);
+    if (server.listening) {
+      server.close(done);
+    } else {
+      done();
+    }
   });
 
   describe('Status Code', () => {
