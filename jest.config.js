@@ -42,5 +42,11 @@ module.exports = {
   clearMocks: true,
 
   // Restore mocks automatically after each test
-  restoreMocks: true
+  restoreMocks: true,
+
+  // Run tests sequentially to avoid server sharing issues
+  maxWorkers: 1,
+
+  // Force exit after tests complete to close any open handles
+  forceExit: true
 };
