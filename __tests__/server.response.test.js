@@ -25,8 +25,13 @@ const EXPECTED_CONTENT_TYPE = 'text/plain';
 const NEWLINE_CHAR_CODE = 0x0A; // ASCII code for '\n'
 
 describe('Server Response Validation', () => {
-  // Note: Server is not closed here - Jest forceExit handles cleanup
-  // This prevents issues with shared server instance across test files
+  /**
+   * Close server after all tests complete to prevent open handles.
+   * This ensures proper cleanup of resources and allows Jest to exit cleanly.
+   */
+  afterAll((done) => {
+    server.close(done);
+  });
 
   describe('Status Code', () => {
     test('should return 200 OK status code', async () => {
