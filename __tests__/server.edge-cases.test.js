@@ -26,8 +26,19 @@ const EXPECTED_BODY = 'Hello, World!\n';
 const EXPECTED_STATUS = 200;
 
 describe('Server Edge Cases', () => {
-  // Note: Server is not closed here - Jest forceExit handles cleanup
-  // This prevents issues with shared server instance across test files
+  /**
+   * Close the server after all tests complete to ensure clean shutdown
+   * and prevent open handle warnings in Jest.
+   * Checks if server is listening before attempting to close to avoid
+   * "Server is not running" errors when running as part of a test suite.
+   */
+  afterAll((done) => {
+    if (server.listening) {
+      server.close(done);
+    } else {
+      done();
+    }
+  });
 
   describe('Special Characters in URL', () => {
     test('should handle URL-encoded spaces', async () => {
@@ -178,7 +189,73 @@ describe('Server Edge Cases', () => {
     });
   });
 
-  describe('Multiple Requests', () => {
+  describe('Concurrent Requests', () => {
+    test('should handle concurrent requests using Promise.all', async () => {
+      // Make multiple concurrent requests using Promise.all
+      const responses = await Promise.all([
+        request(server).get('/'),
+        request(server).get('/concurrent-1'),
+        request(server).get('/concurrent-2'),
+        request(server).get('/concurrent-3'),
+        request(server).get('/concurrent-4')
+      ]);
+
+      expect(responses.length).toBe(5);
+      responses.forEach((response) => {
+        expect(response.status).toBe(EXPECTED_STATUS);
+        expect(response.text).toBe(EXPECTED_BODY);
+      });
+    });
+
+    test('should handle many concurrent requests simultaneously', async () => {
+      // Create 10 concurrent requests
+      const requestPromises = Array.from({ length: 10 }, (_, i) =>
+        request(server).get(`/concurrent-request-${i}`)
+      );
+
+      const responses = await Promise.all(requestPromises);
+
+      expect(responses.length).toBe(10);
+      responses.forEach((response, index) => {
+        expect(response.status).toBe(EXPECTED_STATUS);
+        expect(response.text).toBe(EXPECTED_BODY);
+      });
+    });
+
+    test('should handle concurrent requests with different HTTP methods', async () => {
+      // Make concurrent requests with different HTTP methods
+      const responses = await Promise.all([
+        request(server).get('/method-test'),
+        request(server).post('/method-test'),
+        request(server).put('/method-test'),
+        request(server).delete('/method-test'),
+        request(server).patch('/method-test')
+      ]);
+
+      expect(responses.length).toBe(5);
+      responses.forEach((response) => {
+        expect(response.status).toBe(EXPECTED_STATUS);
+        expect(response.text).toBe(EXPECTED_BODY);
+      });
+    });
+
+    test('should handle burst of concurrent requests', async () => {
+      // Simulate a burst of 20 concurrent requests
+      const burstRequests = Array.from({ length: 20 }, (_, i) =>
+        request(server).get(`/burst-${i}`)
+      );
+
+      const responses = await Promise.all(burstRequests);
+
+      expect(responses.length).toBe(20);
+      responses.forEach((response) => {
+        expect(response.status).toBe(EXPECTED_STATUS);
+        expect(response.text).toBe(EXPECTED_BODY);
+      });
+    });
+  });
+
+  describe('Sequential Requests', () => {
     test('should handle multiple sequential requests successfully', async () => {
       // Test that multiple requests all return the same result
       const response1 = await request(server).get('/');
