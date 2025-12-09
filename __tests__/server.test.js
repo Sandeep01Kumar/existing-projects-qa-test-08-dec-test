@@ -24,9 +24,15 @@ describe('HTTP Server', () => {
   /**
    * Close the server after all tests complete to ensure clean shutdown
    * and prevent open handle warnings in Jest
+   * Note: Only close if server is listening to avoid "Server is not running" errors
+   * Jest's forceExit config will handle cleanup if server isn't listening
    */
   afterAll((done) => {
-    server.close(done);
+    if (server.listening) {
+      server.close(done);
+    } else {
+      done();
+    }
   });
 
   describe('HTTP Responses', () => {
