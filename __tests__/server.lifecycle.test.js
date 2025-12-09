@@ -35,8 +35,14 @@ describe('Server Lifecycle', () => {
     jest.restoreAllMocks();
   });
 
-  // Note: Server is not closed here - Jest forceExit handles cleanup
-  // This prevents issues with shared server instance across test files
+  // Ensure server is closed after all tests complete
+  afterAll((done) => {
+    if (server.listening) {
+      server.close(done);
+    } else {
+      done();
+    }
+  });
 
   describe('Server Instance', () => {
     test('should have server instance available', () => {
