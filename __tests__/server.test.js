@@ -21,8 +21,13 @@ const EXPECTED_STATUS = 200;
 const EXPECTED_CONTENT_TYPE = 'text/plain';
 
 describe('HTTP Server', () => {
-  // Note: Server is not closed here - Jest forceExit handles cleanup
-  // This prevents issues with shared server instance across test files
+  /**
+   * Close the server after all tests complete to ensure clean shutdown
+   * and prevent open handle warnings in Jest
+   */
+  afterAll((done) => {
+    server.close(done);
+  });
 
   describe('HTTP Responses', () => {
     test('should return 200 status code', async () => {
