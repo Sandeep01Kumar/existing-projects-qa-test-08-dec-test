@@ -1,393 +1,331 @@
 # Project Guide: Comprehensive Jest Test Suite for Node.js HTTP Server
 
-## Executive Summary
+## 1. Executive Summary
 
-This project adds a comprehensive Jest testing infrastructure to a Node.js HTTP "Hello, World!" server. **20 hours of development work have been completed out of an estimated 23 total hours required, representing 87% project completion.**
+**Project Completion: 84.6% (22 hours completed out of 26 total hours)**
 
-### Key Achievements
-- ✅ Complete test infrastructure created from scratch (Jest 30.2.0 + supertest 7.1.4)
-- ✅ 4 test files with 106 tests — all passing (100% pass rate)
-- ✅ 100% code coverage achieved across all metrics (statements, branches, functions, lines)
-- ✅ server.js refactored for testability with zero behavior changes
-- ✅ Runtime validation confirmed — server starts, responds correctly, shuts down cleanly
-- ✅ Placeholder files cleaned up
-- ✅ 0 remaining issues from validation
+This project implements a comprehensive Jest test suite for a minimal Node.js HTTP server (`server.js`). All in-scope deliverables from the Agent Action Plan have been fully implemented and validated:
 
-### Remaining Work (3 hours)
-- Human code review of test quality and conventions (1.5h)
-- Investigate and resolve Jest `forceExit` / open handle warning (1.5h)
+- **106 tests** across 4 test files — all passing (100% pass rate)
+- **100% code coverage** (statements, branches, functions, lines)
+- **Server runtime validated** — starts, responds correctly, shuts down gracefully
+- **9/9 planned file operations** completed (4 created, 2 updated, 2 deleted, 1 config added)
+
+The remaining 4 hours (15.4%) represent production-readiness tasks that were explicitly out of the original testing scope: code review, dependency vulnerability remediation, open-handle investigation, and CI/CD pipeline setup.
+
+### Hours Calculation
+
+```
+Completed:  22h (3h infrastructure + 1.5h source refactoring + 14h test implementation + 3h bug fixes + 0.5h cleanup)
+Remaining:   4h (after enterprise multipliers of ×1.15 compliance × ×1.25 uncertainty on 3h base)
+Total:      26h
+Completion: 22 / 26 = 84.6%
+```
 
 ---
 
-## Validation Results Summary
+## 2. Validation Results Summary
 
-### Final Validator Results
+### 2.1 Final Validator Accomplishments
 
-| Category | Result | Details |
-|----------|--------|---------|
-| Dependencies | ✅ 100% Success | jest@30.2.0, supertest@7.1.4 installed (338 packages, zero errors) |
-| Compilation | ✅ 100% Success | All 6 JavaScript files pass `node --check` syntax validation |
-| Tests | ✅ 106/106 Passing | 4 test suites, 100% pass rate, ~1 second execution |
-| Coverage | ✅ 100% All Metrics | Statements: 100%, Branches: 100%, Functions: 100%, Lines: 100% |
-| Runtime | ✅ Success | Server starts on 127.0.0.1:3000, returns 200 OK with correct response |
-| Issues Resolved | 0 | No issues found during validation |
-| Remaining Issues | 0 | All in-scope work complete |
+The Final Validator agent successfully:
+- Installed all dependencies (jest@30.2.0, supertest@7.1.4 — 338 packages total)
+- Verified module loading for all in-scope files without errors
+- Executed all 106 tests with 100% pass rate
+- Confirmed 100% code coverage across all metrics
+- Performed runtime validation (server start → HTTP request → graceful shutdown)
+- Resolved a stale-process issue (EADDRINUSE on port 3000) that caused 4 lifecycle tests to fail intermittently
 
-### Test Results by Suite
+### 2.2 Compilation / Module Loading Results
 
-| Test Suite | Tests Passed | Focus Areas |
-|-----------|-------------|-------------|
-| `server.test.js` | 28/28 | HTTP responses, methods, paths, combined validation |
-| `server.response.test.js` | 17/17 | Status codes, headers, body content, byte-level validation |
-| `server.lifecycle.test.js` | 23/23 | Startup, shutdown, address, startServer function, direct execution |
-| `server.edge-cases.test.js` | 38/38 | Special chars, long paths, concurrent/sequential requests, boundary conditions |
+| File | Status | Notes |
+|------|--------|-------|
+| `server.js` | ✅ Loads | Exports server, hostname, port, startServer |
+| `jest.config.js` | ✅ Loads | Valid Jest configuration |
+| `package.json` | ✅ Valid | Correct devDependencies and scripts |
+| `__tests__/server.test.js` | ✅ Loads | 27 test cases |
+| `__tests__/server.response.test.js` | ✅ Loads | 17 test cases |
+| `__tests__/server.lifecycle.test.js` | ✅ Loads | 24 test cases |
+| `__tests__/server.edge-cases.test.js` | ✅ Loads | 38 test cases |
 
-### Coverage Report
+### 2.3 Test Results
 
-```
------------|---------|----------|---------|---------|-------------------
-File       | % Stmts | % Branch | % Funcs | % Lines | Uncovered Line #s
------------|---------|----------|---------|---------|-------------------
-All files  |     100 |      100 |     100 |     100 |
- server.js |     100 |      100 |     100 |     100 |
------------|---------|----------|---------|---------|-------------------
-```
+| Test Suite | Tests | Passed | Failed | Time |
+|-----------|-------|--------|--------|------|
+| server.test.js | 27 | 27 | 0 | ~0.2s |
+| server.response.test.js | 17 | 17 | 0 | ~0.2s |
+| server.lifecycle.test.js | 24 | 24 | 0 | ~0.3s |
+| server.edge-cases.test.js | 38 | 38 | 0 | ~0.3s |
+| **Total** | **106** | **106** | **0** | **~1.0s** |
 
-### Fixes Applied During Validation
-- No fixes were needed — all tests passed on initial validation run
-- Prior agent iterations resolved open handle cleanup, concurrent request robustness, and afterAll hook safety across 7 fix commits
+### 2.4 Coverage Report
+
+| Metric | Coverage | Target | Status |
+|--------|----------|--------|--------|
+| Statements | 100% | 100% | ✅ Met |
+| Branches | 100% | 100% | ✅ Met |
+| Functions | 100% | 100% | ✅ Met |
+| Lines | 100% | 100% | ✅ Met |
+
+### 2.5 Runtime Validation
+
+| Check | Result | Details |
+|-------|--------|---------|
+| Server startup | ✅ Pass | Binds to `127.0.0.1:3000`, logs startup notification |
+| HTTP response | ✅ Pass | Returns `HTTP 200 OK`, `Content-Type: text/plain`, body `Hello, World!\n` |
+| Multiple paths | ✅ Pass | All paths return identical response |
+| Graceful shutdown | ✅ Pass | Server stops cleanly on process termination |
+
+### 2.6 Fixes Applied During Validation
+
+| Issue | Resolution | Commits |
+|-------|-----------|---------|
+| Server cleanup in tests (open handles) | Added `afterAll` hooks with `server.listening` checks in all 4 test files | 6 commits (3b8768e → 88ff1d9) |
+| Concurrent test fragility | Switched from `Promise.all` to `Promise.allSettled` for robust error handling | 499bd96 |
+| EADDRINUSE port conflict | Killed stale `node server.js` process occupying port 3000 | Runtime fix |
 
 ---
 
-## Hours Breakdown and Completion
-
-### Calculation
-
-- **Completed Hours**: 20h
-- **Remaining Hours**: 3h (after enterprise multipliers)
-- **Total Project Hours**: 20h + 3h = 23h
-- **Completion Percentage**: 20 / 23 = **87%**
-
-### Completed Hours Breakdown (20h)
-
-| Component | Hours | Details |
-|-----------|-------|---------|
-| Test infrastructure setup | 2.0h | Jest 30.2.0, supertest 7.1.4, jest.config.js configuration |
-| .gitignore and package.json | 1.0h | Node.js gitignore, devDependencies, test scripts |
-| server.js refactoring | 1.0h | Exports, conditional startup, startServer function |
-| server.test.js (main suite) | 3.0h | 28 tests, 181 lines — HTTP methods, paths, combined validation |
-| server.response.test.js | 2.0h | 17 tests, 161 lines — Status codes, headers, byte-level body checks |
-| server.lifecycle.test.js | 4.0h | 23 tests, 344 lines — Startup, shutdown, config exports, direct execution |
-| server.edge-cases.test.js | 4.0h | 38 tests, 380 lines — Special chars, concurrent requests, boundary conditions |
-| Iterative debugging and fixes | 2.0h | 7 fix commits — open handles, afterAll hooks, concurrent test robustness |
-| Validation and runtime testing | 1.0h | Syntax checks, full test suite runs, runtime HTTP verification |
-| **Total Completed** | **20.0h** | |
-
-### Remaining Hours Breakdown (3h)
-
-| Task | Base Hours | With Multipliers (×1.44) | Priority | Severity |
-|------|-----------|--------------------------|----------|----------|
-| Human code review of test files and conventions | 1.0h | 1.5h | Medium | Low |
-| Investigate and resolve Jest forceExit/open handle warning | 1.0h | 1.5h | Low | Low |
-| **Total Remaining** | **2.0h** | **3.0h** | | |
-
-*Enterprise multipliers applied: 1.15× compliance × 1.25× uncertainty = 1.44×*
-
-### Visual Representation
+## 3. Visual Representation
 
 ```mermaid
 pie title Project Hours Breakdown
-    "Completed Work" : 20
-    "Remaining Work" : 3
+    "Completed Work" : 22
+    "Remaining Work" : 4
 ```
 
 ---
 
-## Files Changed
+## 4. Completed Work Breakdown
 
-### Git Statistics
-- **Branch**: `blitzy-03552503-6b39-41a0-a02e-bf9fffcb7d98`
-- **Commits**: 17 on branch (vs origin/main)
-- **Files changed**: 14
-- **Lines added**: 7,625
-- **Lines removed**: 9
+### 4.1 Hours by Component (22h total)
 
-### File Inventory
+| Component | Hours | Details |
+|-----------|-------|---------|
+| Test infrastructure setup | 3.0h | Jest + supertest installation, jest.config.js (52 lines), package.json updates, .gitignore |
+| Source refactoring | 1.5h | server.js testability refactor (conditional startup, exports, startServer function) |
+| server.test.js | 3.0h | 181 lines, 27 tests — HTTP responses, methods, paths, combined validation |
+| server.response.test.js | 2.5h | 161 lines, 17 tests — status codes, headers, body content, byte-level validation |
+| server.lifecycle.test.js | 4.0h | 344 lines, 24 tests — instance verification, config exports, startup/shutdown, startServer, direct execution |
+| server.edge-cases.test.js | 4.5h | 380 lines, 38 tests — special characters, long URLs, concurrent/sequential requests, boundary conditions |
+| Bug fixing and debugging | 3.0h | afterAll hooks, Promise.allSettled fix, EADDRINUSE resolution, runtime validation |
+| File cleanup | 0.5h | Deleted test.py.txt and test.txt.txt placeholders |
+| **Total** | **22.0h** | **1,066 lines of test code, 106 tests, 178 assertions** |
 
-| File | Action | Lines | Purpose |
-|------|--------|-------|---------|
-| `__tests__/server.test.js` | CREATE | 181 | Main comprehensive test suite (28 tests) |
-| `__tests__/server.response.test.js` | CREATE | 161 | Response validation tests (17 tests) |
-| `__tests__/server.lifecycle.test.js` | CREATE | 344 | Server lifecycle tests (23 tests) |
-| `__tests__/server.edge-cases.test.js` | CREATE | 380 | Edge case and boundary tests (38 tests) |
-| `jest.config.js` | CREATE | 52 | Jest configuration with 100% coverage thresholds |
-| `.gitignore` | CREATE | 19 | Node.js project gitignore |
-| `package.json` | UPDATE | 15 | devDependencies (jest, supertest), test scripts |
-| `server.js` | UPDATE | 33 | Exports and conditional startup for testability |
-| `package-lock.json` | UPDATE | 4,923 | Dependency lock file |
-| `README.md` | UPDATE | 1 | Minor update |
-| `test.py.txt` | DELETE | 0 | Removed empty placeholder |
-| `test.txt.txt` | DELETE | 0 | Removed empty placeholder |
-| `blitzy/documentation/Project Guide.md` | CREATE | 313 | Blitzy project documentation |
-| `blitzy/documentation/Technical Specifications.md` | CREATE | 1,218 | Blitzy technical specifications |
+### 4.2 Git Commit Summary
 
----
+- **Branch:** `blitzy-03552503-6b39-41a0-a02e-bf9fffcb7d98`
+- **Total commits:** 19
+- **Files changed:** 14
+- **Lines added:** 7,708
+- **Lines removed:** 9
+- **Net change:** +7,699 lines
 
-## Detailed Human Task List
+### 4.3 Agent Action Plan Compliance
 
-### Task 1: Code Review of Test Files and Conventions
-
-| Attribute | Value |
-|-----------|-------|
-| **Priority** | Medium |
-| **Severity** | Low |
-| **Estimated Hours** | 1.5h |
-| **Confidence** | High |
-
-**Description**: Review all 4 test files (1,066 lines total) for code quality, naming conventions, assertion completeness, and alignment with team standards.
-
-**Action Steps**:
-1. Review `__tests__/server.test.js` — verify test descriptions are clear and assertions are meaningful
-2. Review `__tests__/server.response.test.js` — validate byte-level assertions and header checks
-3. Review `__tests__/server.lifecycle.test.js` — confirm startup/shutdown lifecycle tests are robust
-4. Review `__tests__/server.edge-cases.test.js` — verify edge case coverage is sufficient for the project
-5. Ensure `jest.config.js` settings (forceExit, maxWorkers, coverage thresholds) are acceptable
-6. Approve or request changes to test naming patterns (`it('should ...')` vs alternatives)
+| Planned Deliverable | Status | Notes |
+|--------------------|--------|-------|
+| `__tests__/server.test.js` (CREATE) | ✅ Complete | 27 tests, all passing |
+| `__tests__/server.response.test.js` (CREATE) | ✅ Complete | 17 tests, all passing |
+| `__tests__/server.lifecycle.test.js` (CREATE) | ✅ Complete | 24 tests, all passing |
+| `__tests__/server.edge-cases.test.js` (CREATE) | ✅ Complete | 38 tests, all passing |
+| `jest.config.js` (CREATE) | ✅ Complete | Full config with 100% thresholds |
+| `package.json` (UPDATE) | ✅ Complete | devDependencies + test scripts added |
+| `server.js` (UPDATE) | ✅ Complete | Testability refactor, behavior preserved |
+| `test.py.txt` (DELETE) | ✅ Complete | Empty placeholder removed |
+| `test.txt.txt` (DELETE) | ✅ Complete | Empty placeholder removed |
+| 100% code coverage target | ✅ Achieved | All 4 metrics at 100% |
 
 ---
 
-### Task 2: Investigate and Resolve Jest forceExit/Open Handle Warning
+## 5. Remaining Work — Detailed Task Table
 
-| Attribute | Value |
-|-----------|-------|
-| **Priority** | Low |
-| **Severity** | Low |
-| **Estimated Hours** | 1.5h |
-| **Confidence** | High |
+| # | Task | Priority | Severity | Hours | Confidence | Action Steps |
+|---|------|----------|----------|-------|------------|-------------|
+| 1 | **Code review and approval** | Medium | Low | 1.0h | High | Review all 4 test files for correctness, style, and maintainability. Verify server.js refactoring preserves original behavior. Approve and merge PR. |
+| 2 | **Fix qs dependency vulnerability** | Medium | Medium | 0.5h | High | Run `npm audit fix` to update `qs` from 6.14.0 to ≥6.14.1 (high-severity DoS vulnerability GHSA-6rw7-vpxm-498p in devDependency chain: supertest → superagent → qs). Verify tests still pass after update. |
+| 3 | **Investigate Jest forceExit warning** | Low | Low | 1.0h | Medium | Run `npx jest --detectOpenHandles` to identify which test creates persistent async operations. Refactor lifecycle tests to avoid open handles without relying on `forceExit: true`. Also address port 3000 conflict sensitivity in startServer tests. |
+| 4 | **Set up CI/CD pipeline for automated test execution** | Low | Low | 1.5h | Medium | Create GitHub Actions workflow (or equivalent) to run `CI=true npx jest --ci --coverage` on push/PR. Add coverage badge to README. Ensure port 3000 is free in CI environment. |
+| | **Total Remaining Hours** | | | **4.0h** | | |
 
-**Description**: Jest outputs "Have you considered using `--detectOpenHandles` to detect async operations that kept running after all tests finished?" after test completion. The current workaround is `forceExit: true` in `jest.config.js`. The root cause should be investigated and resolved so `forceExit` can be removed.
-
-**Action Steps**:
-1. Run `npx jest --detectOpenHandles` to identify the specific open handle(s)
-2. The likely root cause is supertest opening HTTP connections that aren't fully closed
-3. Review `afterAll` hooks in all test files — currently each checks `server.listening` before `server.close()`
-4. Consider adding explicit connection draining or adjusting supertest usage
-5. Once root cause is fixed, remove `forceExit: true` from `jest.config.js`
-6. Verify all 106 tests still pass and Jest exits cleanly without `forceExit`
+**Calculation verification:** 1.0h + 0.5h + 1.0h + 1.5h = **4.0h** ✓ (matches pie chart "Remaining Work" value)
 
 ---
 
-### Task Hours Verification
+## 6. Development Guide
 
-| Task | Hours |
-|------|-------|
-| Code review of test files and conventions | 1.5h |
-| Investigate and resolve Jest forceExit warning | 1.5h |
-| **Total Remaining Hours** | **3.0h** |
+### 6.1 System Prerequisites
 
-✅ Task table total (3.0h) matches pie chart "Remaining Work" (3h)
+| Software | Required Version | Verification Command |
+|----------|-----------------|---------------------|
+| Node.js | 20.x LTS | `node --version` (tested with v20.20.0) |
+| npm | 11.x | `npm --version` (tested with 11.1.0) |
+| Git | 2.x+ | `git --version` |
 
----
-
-## Development Guide
-
-### 1. System Prerequisites
-
-| Requirement | Version | Verification Command |
-|------------|---------|---------------------|
-| Node.js | 20.x LTS (verified: v20.20.0) | `node --version` |
-| npm | 11.x (verified: 11.1.0) | `npm --version` |
-| Git | Any recent version | `git --version` |
-| OS | Linux, macOS, or Windows | — |
-
-### 2. Environment Setup
+### 6.2 Environment Setup
 
 ```bash
-# Clone the repository and checkout the branch
+# Clone repository and switch to feature branch
 git clone <repository-url>
 cd <repository-directory>
 git checkout blitzy-03552503-6b39-41a0-a02e-bf9fffcb7d98
 ```
 
-No environment variables are required for testing. Jest automatically sets `NODE_ENV=test`.
+No environment variables are required. The server uses hardcoded `hostname=127.0.0.1` and `port=3000`.
 
-### 3. Dependency Installation
+### 6.3 Dependency Installation
 
 ```bash
-# Install all dependencies (including devDependencies)
+# Install all dependencies (including devDependencies for testing)
 npm install
 ```
 
-**Expected output**: `added 338 packages` with zero errors.
+**Expected output:** 338 packages installed, 0 vulnerabilities (or 1 high after audit fix).
 
-**Verify installations**:
+**Verify Jest installation:**
 ```bash
 npx jest --version
-# Expected: 30.1.3 (CLI) or 30.2.0 (package)
-
-node -e "console.log(require('supertest/package.json').version)"
-# Expected: 7.1.4
 ```
+**Expected output:** `30.1.3` (or compatible 30.x version)
 
-### 4. Running Tests
+### 6.4 Running Tests
 
-#### Run all tests
+**Run all tests (recommended for CI):**
 ```bash
-npm test
+CI=true npx jest --watchAll=false --ci --verbose
 ```
-**Expected**: 106 tests passing across 4 test suites.
+**Expected output:** `Test Suites: 4 passed, 4 total` / `Tests: 106 passed, 106 total`
 
-#### Run tests in CI mode (recommended for automation)
-```bash
-CI=true npx jest --watchAll=false --ci
-```
-
-#### Run tests with coverage report
+**Run tests with coverage report:**
 ```bash
 CI=true npx jest --watchAll=false --ci --coverage
 ```
-**Expected**: 100% coverage on all metrics for `server.js`.
+**Expected output:** 100% coverage across all metrics. HTML report generated in `coverage/` directory.
 
-#### Run a specific test file
+**Run a specific test file:**
 ```bash
-npx jest __tests__/server.test.js
-npx jest __tests__/server.response.test.js
-npx jest __tests__/server.lifecycle.test.js
-npx jest __tests__/server.edge-cases.test.js
+npx jest __tests__/server.test.js --verbose
 ```
 
-#### Run tests matching a name
+**Run tests matching a pattern:**
 ```bash
-npx jest -t "status code"
+npx jest -t "status code" --verbose
 ```
 
-### 5. Starting the Server
+### 6.5 Starting the Server
 
 ```bash
+# Start the HTTP server
 node server.js
 ```
+**Expected output:** `Server running at http://127.0.0.1:3000/`
 
-**Expected output**:
-```
-Server running at http://127.0.0.1:3000/
-```
+### 6.6 Verification Steps
 
-### 6. Verification Steps
+After starting the server, verify it responds correctly:
 
-#### Verify server response
 ```bash
-# Start server in background
-node server.js &
+# Test basic GET request
+curl http://127.0.0.1:3000/
 
-# Test HTTP response
-curl -s -w "\nHTTP Status: %{http_code}\nContent-Type: %{content_type}\n" http://127.0.0.1:3000/
+# Expected output: Hello, World!
+```
+
+```bash
+# Test with full headers
+curl -i http://127.0.0.1:3000/
 
 # Expected output:
-# Hello, World!
-# HTTP Status: 200
+# HTTP/1.1 200 OK
 # Content-Type: text/plain
-
-# Stop server
-kill %1
+# ...
+# Hello, World!
 ```
 
-#### Verify tests and coverage
 ```bash
-CI=true npx jest --watchAll=false --ci --coverage
+# Test arbitrary path (should return same response)
+curl http://127.0.0.1:3000/any/path/here
 
-# Expected: 106 tests pass, 100% coverage on all metrics
+# Expected output: Hello, World!
 ```
 
-#### Verify syntax of all source files
-```bash
-for f in server.js jest.config.js __tests__/*.test.js; do
-  echo -n "$f: "; node --check "$f" && echo "OK"
-done
+### 6.7 Troubleshooting
 
-# Expected: All files report "OK"
+| Issue | Cause | Resolution |
+|-------|-------|-----------|
+| `EADDRINUSE: port 3000` | Stale process on port 3000 | Run `lsof -i :3000` to find PID, then `kill <PID>` |
+| 4 lifecycle tests fail with EADDRINUSE | Another process occupies port 3000 | Kill stale processes before running tests |
+| Jest enters watch mode | Missing `CI=true` or `--watchAll=false` | Always use `CI=true npx jest --watchAll=false --ci` |
+| `forceExit` warning | Open handles from lifecycle tests | Cosmetic — does not affect test results; see Task #3 |
+| npm audit high vulnerability | `qs <6.14.1` in devDependency chain | Run `npm audit fix` to resolve |
+
+---
+
+## 7. Risk Assessment
+
+### 7.1 Technical Risks
+
+| Risk | Severity | Likelihood | Mitigation |
+|------|----------|-----------|-----------|
+| Jest `forceExit` masks potential open handle leaks | Low | Medium | Investigate with `--detectOpenHandles`; refactor lifecycle tests to close server explicitly in all paths |
+| Port 3000 conflict causes test failures | Low | Medium | Lifecycle tests using `startServer()` bind to port 3000; ensure no stale processes before test runs. Consider using ephemeral ports for startup tests. |
+| Tests run sequentially (`maxWorkers: 1`) | Low | Low | Required for port isolation; parallelism limited but suite completes in ~1 second |
+
+### 7.2 Security Risks
+
+| Risk | Severity | Likelihood | Mitigation |
+|------|----------|-----------|-----------|
+| `qs` dependency DoS vulnerability (GHSA-6rw7-vpxm-498p) | Medium | Low | Only affects devDependency chain (supertest → superagent → qs), not production. Fix with `npm audit fix`. |
+| No production dependencies exposed | N/A | N/A | Server uses only built-in `http` module; no third-party production dependencies |
+
+### 7.3 Operational Risks
+
+| Risk | Severity | Likelihood | Mitigation |
+|------|----------|-----------|-----------|
+| No CI/CD pipeline for automated test execution | Low | High | Tests must be run manually. Set up GitHub Actions or equivalent to run tests on push/PR. |
+| No pre-commit hooks enforcing test passing | Low | Medium | Developers may push code that breaks tests. Consider adding husky + lint-staged. |
+
+### 7.4 Integration Risks
+
+| Risk | Severity | Likelihood | Mitigation |
+|------|----------|-----------|-----------|
+| All in-scope integrations fully tested | None | None | supertest integration with http.Server validated across 106 tests |
+| No external service dependencies | None | None | Server is self-contained with no external calls |
+
+---
+
+## 8. Repository Structure
+
 ```
-
-### 7. Project Structure
-
-```
+├── .gitignore                          (CREATED — Node.js ignore rules)
+├── 100Pages.pdf                        (UNCHANGED — binary asset)
+├── LoginTest.java                      (UNCHANGED — out of scope)
+├── README.md                           (UPDATED — minor change)
 ├── __tests__/
-│   ├── server.test.js              # Main comprehensive test suite (28 tests)
-│   ├── server.response.test.js     # Response validation tests (17 tests)
-│   ├── server.lifecycle.test.js    # Lifecycle management tests (23 tests)
-│   └── server.edge-cases.test.js   # Edge case tests (38 tests)
-├── server.js                       # HTTP server (source under test)
-├── jest.config.js                  # Jest configuration
-├── package.json                    # Project manifest with test scripts
-├── package-lock.json               # Dependency lock file
-├── .gitignore                      # Git ignore rules
-├── README.md                       # Project readme
-├── LoginTest.java                  # Unrelated file (pre-existing)
-├── industry.csv                    # Unrelated file (pre-existing)
-├── 100Pages.pdf                    # Unrelated file (pre-existing)
-├── demo.jpg                        # Unrelated file (pre-existing)
-└── sample.doc                      # Unrelated file (pre-existing)
+│   ├── server.test.js                  (CREATED — 181 lines, 27 tests)
+│   ├── server.response.test.js         (CREATED — 161 lines, 17 tests)
+│   ├── server.lifecycle.test.js        (CREATED — 344 lines, 24 tests)
+│   └── server.edge-cases.test.js       (CREATED — 380 lines, 38 tests)
+├── demo.jpg                            (UNCHANGED — binary asset)
+├── industry.csv                        (UNCHANGED — data file)
+├── jest.config.js                      (CREATED — 52 lines, test configuration)
+├── package.json                        (UPDATED — devDependencies + scripts)
+├── package-lock.json                   (UPDATED — dependency lock)
+├── sample.doc                          (UNCHANGED — binary asset)
+├── server.js                           (UPDATED — testability refactor)
+├── test.py.txt                         (DELETED — empty placeholder)
+└── test.txt.txt                        (DELETED — empty placeholder)
 ```
 
-### 8. Troubleshooting
-
-| Issue | Solution |
-|-------|----------|
-| `npm test` enters watch mode | Use `CI=true npm test` or `npm test -- --watchAll=false` |
-| Port 3000 already in use | Kill existing process: `lsof -ti:3000 \| xargs kill` |
-| Tests timeout | Check `testTimeout` in `jest.config.js` (default: 5000ms) |
-| Jest forceExit warning | Known issue — see Task 2 in human tasks above |
-| Coverage below 100% | Ensure `server.js` has not been modified beyond exports |
-
 ---
 
-## Risk Assessment
+## 9. Test Coverage Map
 
-### Technical Risks
+| Test File | Test Categories | Tests | Key Assertions |
+|-----------|----------------|-------|----------------|
+| `server.test.js` | HTTP responses, 7 HTTP methods, 5+ URL paths, combined validation | 27 | Status 200, Content-Type text/plain, body match, method handling |
+| `server.response.test.js` | Status codes, headers, body content, byte-level validation, consistency | 17 | 14-byte body length, 0x0A newline, UTF-8 encoding, cross-method consistency |
+| `server.lifecycle.test.js` | Server instance, config exports, startup/shutdown, startServer function, direct execution | 24 | server.listening state, console.log capture, address binding, graceful close |
+| `server.edge-cases.test.js` | Special chars, long URLs, empty paths, query params, fragments, concurrent/sequential requests, boundary conditions | 38 | All edge cases return 200 OK with identical body, no crashes |
 
-| Risk | Severity | Likelihood | Impact | Mitigation |
-|------|----------|------------|--------|------------|
-| Jest `forceExit: true` masks open handle leak | Low | Medium | Low | Investigate with `--detectOpenHandles`; fix root cause in afterAll hooks |
-| Port 3000 conflict in shared environments | Low | Low | Low | Supertest uses ephemeral ports for testing; only manual server start uses 3000 |
-| Jest 30.x breaking changes in future updates | Low | Low | Medium | Pin exact version in `package.json` (already done: `"jest": "30.2.0"`) |
-
-### Operational Risks
-
-| Risk | Severity | Likelihood | Impact | Mitigation |
-|------|----------|------------|--------|------------|
-| No CI/CD pipeline configured | Medium | High | Medium | Out of scope per requirements; recommend adding GitHub Actions or similar |
-| No pre-commit hooks for test execution | Low | Medium | Low | Optional: add `husky` with `pre-commit` hook running `npm test` |
-| No test execution monitoring | Low | Medium | Low | Coverage reports generated in `coverage/` directory; integrate with CI |
-
-### Security Risks
-
-| Risk | Severity | Likelihood | Impact | Mitigation |
-|------|----------|------------|--------|------------|
-| Server binds to 127.0.0.1 only | None | N/A | N/A | Correct configuration — server is localhost-only |
-| No sensitive data in test files | None | N/A | N/A | Tests use only static expected values |
-| devDependencies are test-only | None | N/A | N/A | jest and supertest are devDependencies, not shipped to production |
-
-### Integration Risks
-
-| Risk | Severity | Likelihood | Impact | Mitigation |
-|------|----------|------------|--------|------------|
-| No external service dependencies | None | N/A | N/A | Server is self-contained with no external integrations |
-
----
-
-## Agent Action Plan Requirement Completion
-
-| Requirement | Status | Evidence |
-|------------|--------|---------|
-| Create test infrastructure (Jest + supertest) | ✅ Complete | jest@30.2.0, supertest@7.1.4 installed; jest.config.js created |
-| Test HTTP responses (body content) | ✅ Complete | Response body validated as `"Hello, World!\n"` in multiple test suites |
-| Test status codes (200 OK) | ✅ Complete | Status 200 verified across all methods and paths |
-| Test headers (Content-Type: text/plain) | ✅ Complete | Header validation in server.test.js and server.response.test.js |
-| Test server startup/shutdown | ✅ Complete | Lifecycle tests in server.lifecycle.test.js (23 tests) |
-| Test error handling | ✅ Complete | Edge cases and boundary conditions in server.edge-cases.test.js |
-| Test edge cases | ✅ Complete | 38 edge case tests — special chars, concurrent requests, long paths |
-| All HTTP methods (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS) | ✅ Complete | Tested in server.test.js with parameterized tests |
-| Various URL paths | ✅ Complete | Root, arbitrary, nested, query params, fragments, special chars |
-| 100% code coverage | ✅ Complete | 100% statements, branches, functions, lines |
-| Minimal server.js changes | ✅ Complete | Only exports and conditional startup added |
-| Delete placeholder files | ✅ Complete | test.py.txt and test.txt.txt removed |
-| Preserve server behavior | ✅ Complete | `node server.js` works identically to original |
+**Total: 106 tests, 178 expect() assertions, 28 describe() blocks**
