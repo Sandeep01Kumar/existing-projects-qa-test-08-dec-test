@@ -1010,12 +1010,15 @@ module.exports = {
 **Setup Commands:**
 ```bash
 # Install dependencies
+
 npm install
 
 #### Verify Jest installation
+
 npx jest --version
 
 #### Run tests
+
 npm test
 ```
 
