@@ -1,2 +1,1 @@
-# hao-backprop-test
-test project for backprop integration. Do not touch!
+This project is created for QA testing.
