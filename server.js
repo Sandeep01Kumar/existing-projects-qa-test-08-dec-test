@@ -115,15 +115,24 @@ const sockets = new Set();
 // with their socket (SRV-11).
 const failureLogged = new WeakSet();
 
-// Sockets on which a complete HTTP response has already been emitted for the
-// request currently bound to that socket. The server-level 'clientError'
-// handler consults this so it never synthesizes a SECOND response (e.g. a
-// spurious 400 after a 413 for an oversized body that the client then aborted),
-// which would put two responses on one connection - an HTTP/1.1 framing
-// violation with response-desync / request-smuggling potential (SRV-12). The
-// mark is cleared once the request is fully received (req 'end'), so a later
-// request reusing the same keep-alive socket can still receive its own error
-// response. Keyed weakly so entries disappear with their socket.
+// Sockets on which a complete HTTP response was emitted for the request
+// currently bound to that socket *before that request had fully arrived* (an
+// early 413 body-cap rejection or a request-stream 400). The server-level
+// 'clientError' handler consults this so it never synthesizes a SECOND
+// response (e.g. a spurious 400 after a 413 for an oversized body that the
+// client then aborted), which would put two responses on one connection - an
+// HTTP/1.1 framing violation with response-desync / request-smuggling
+// potential (SRV-12).
+//
+// Only PRE-COMPLETION responses are ever marked. A normal response emitted
+// AFTER the request has fully arrived (a routed 200/404/405/500 produced from
+// the req 'end' handler) is deliberately NOT marked: its request is already
+// complete, so no second response can be provoked for it, and marking it would
+// leave a stale per-socket flag that survives keep-alive reuse and suppress a
+// legitimate 400/408 (and its error log) on the NEXT request over that socket
+// (SRV-REG-01). The mark is cleared on 'end', 'close', and in 'clientError'
+// itself, so a later request reusing the same keep-alive socket always starts
+// unmarked. Keyed weakly so entries disappear with their socket.
 const respondedForRequest = new WeakSet();
 
 // Guard that makes shutdown() idempotent so repeated signals never double-run.
@@ -335,7 +344,13 @@ function handleRequest(req, res) {
   // the instant any terminal action begins, and every guarded helper below
   // no-ops afterwards - eliminating the CWE-367 races where independent async
   // events (data / end / error / close) each tried to respond (SRV-02).
-  const state = { finalized: false, limitExceeded: false };
+  // `ended` flips to true the moment the request has fully arrived (req 'end'),
+  // and is used by finalize() to distinguish an EARLY (pre-completion) response
+  // - which must be recorded on the socket to block a duplicate clientError
+  // response (SRV-12) - from a normal post-completion routed response, which
+  // must NOT be recorded or it would strand a stale mark across keep-alive
+  // reuse and suppress the next connection's 400/408 (SRV-REG-01).
+  const state = { finalized: false, limitExceeded: false, ended: false };
 
   /**
    * Guarded terminal write: emit a full response exactly once. If the request
@@ -360,20 +375,28 @@ function handleRequest(req, res) {
       return;
     }
 
+    // If this response is being emitted BEFORE the request has fully arrived
+    // (an early 413 body-cap rejection, or a request-stream 400), record it on
+    // the socket so the server-level 'clientError' handler will not synthesize
+    // a SECOND response for this same in-flight request should the client then
+    // abort the still-draining body - two responses on one connection is an
+    // HTTP/1.1 framing violation with response-desync potential (SRV-12). The
+    // mark is set BEFORE the terminal write to close any re-entrancy window,
+    // and ONLY for pre-completion responses (!state.ended): a normal
+    // post-'end' routed 200/404/405/500 is never marked, or the stale flag
+    // would survive keep-alive reuse and suppress a legitimate 400/408 (and its
+    // error log) on the next request over this socket (SRV-REG-01). The mark is
+    // cleared on req 'end', req 'close', and within the clientError handler.
+    if (!state.ended && req.socket) {
+      respondedForRequest.add(req.socket);
+    }
+
     try {
       res.writeHead(statusCode, headers);
       if (body === undefined) {
         res.end();
       } else {
         res.end(body);
-      }
-      // A complete response has now been emitted for the request currently on
-      // this socket. Record it so the server-level 'clientError' handler cannot
-      // write a SECOND response for the same request if the client subsequently
-      // aborts a still-draining body (e.g. after a 413) - which would place two
-      // responses on one connection (SRV-12). The mark is cleared on req 'end'.
-      if (req.socket) {
-        respondedForRequest.add(req.socket);
       }
     } catch (writeErr) {
       // A teardown race (socket vanished mid-write) can still throw; abandon
@@ -418,6 +441,12 @@ function handleRequest(req, res) {
   // attempt a second response. No response is attempted or logged here - the
   // 'error' handler owns any failure logging for this connection (SRV-11).
   req.on('close', () => {
+    // The request is over: clear any early-response mark for this socket so a
+    // subsequent request reusing this keep-alive connection starts unmarked and
+    // can receive its own error response (SRV-REG-01 / SRV-12).
+    if (req.socket) {
+      respondedForRequest.delete(req.socket);
+    }
     if (!state.finalized && (req.destroyed || req.complete === false)) {
       abandon();
     }
@@ -462,12 +491,18 @@ function handleRequest(req, res) {
   // (413) is not routed again. The route call is wrapped so an unexpected throw
   // becomes a controlled 500 rather than an uncaught exception.
   req.on('end', () => {
-    // The request has now been fully received. Any response already emitted for
-    // it is no longer "in flight" for HTTP framing, so clear the per-socket
-    // mark: a subsequent request that reuses this keep-alive socket must be able
-    // to receive its own error response (e.g. a legitimate 400/408 from the
-    // 'clientError' handler). Done BEFORE the guard below so it runs even for a
-    // body-capped (413) or already-finalized request (SRV-12).
+    // The request has now been fully received. Flip `ended` FIRST - before the
+    // route call below - so the response routeRequest() emits is treated as a
+    // normal post-completion response and is NOT recorded on the socket by
+    // finalize(); recording it would strand a stale mark that suppresses a
+    // legitimate 400/408 on the next request reusing this keep-alive socket
+    // (SRV-REG-01).
+    state.ended = true;
+    // Clear any early-response mark (e.g. from a 413 whose oversized body has
+    // now fully drained): the request is complete, so a subsequent request that
+    // reuses this keep-alive socket must start unmarked and be able to receive
+    // its own error response (SRV-12). Done BEFORE the guard below so it runs
+    // even for a body-capped (413) or already-finalized request.
     if (req.socket) {
       respondedForRequest.delete(req.socket);
     }
