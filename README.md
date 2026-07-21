@@ -98,9 +98,13 @@ cap → method → path** — and the first failing check determines the status:
 
 1. **Body size** is enforced as the request streams in: a body exceeding the
    1 MiB cap returns `413` regardless of method or path (before any routing).
-2. **Method** is checked next: any method other than `GET`/`HEAD` returns `405`
-   on **any** path. Because method is checked before path, `POST /` and
-   `POST /anything` both return `405` — never `404`.
+2. **Method** is checked next: any method **recognized by Node's HTTP parser**
+   other than `GET`/`HEAD` returns `405` on **any** path. Because method is
+   checked before path, `POST /` and `POST /anything` both return `405` — never
+   `404`. (A method *token* the parser does not recognize — for example an
+   arbitrary or non-standard word — never reaches this check: Node rejects it
+   with a `400` at the parser level, before routing. See **Parser-level
+   rejections** below.)
 3. **Path** is checked last: for an allowed method, any path other than `/`
    returns `404`. A query string on the root (for example `/?x=1`) still
    resolves to `/` and is served normally.
@@ -110,10 +114,24 @@ cap → method → path** — and the first failing check determines the status:
 | `200 OK`                    | `GET /` returns `Content-Type: text/plain` and the body `Hello, World!\n`. `HEAD /` returns the same `200` status and `Content-Type: text/plain` **with no body**; other generated headers may differ (for example `GET` responses are sent with `Transfer-Encoding: chunked`, which `HEAD` does not carry). A query string on `/` (e.g. `/?x=1`) is still the root route. |
 | `400 Bad Request`           | A malformed request line or headers, **while the connection is still writable**. A client that has already disconnected or reset the socket may simply be closed without a response being written. |
 | `404 Not Found`             | An allowed method (`GET`/`HEAD`) on any path other than `/`.                                   |
-| `405 Method Not Allowed`    | Any method other than `GET`/`HEAD`, on any path (the response includes an `Allow: GET, HEAD` header). Method is validated before path. This includes the `CONNECT` tunneling method: although HTTP surfaces `CONNECT` through a separate protocol event rather than the normal request handler, the server answers it with the same `405` + `Allow: GET, HEAD` and then closes the connection, so **no** method escapes validation. |
+| `405 Method Not Allowed`    | Any HTTP method **recognized by Node's HTTP parser** other than `GET`/`HEAD`, on any path (the response includes an `Allow: GET, HEAD` header). Method is validated before path. This includes the `CONNECT` tunneling method: although HTTP surfaces `CONNECT` through a separate protocol event rather than the normal request handler, the server answers it with the same `405` + `Allow: GET, HEAD` and then closes the connection. A method *token* the parser does not recognize is rejected earlier with a `400` (see **Parser-level rejections** below), so **no** method escapes validation. |
 | `408 Request Timeout`       | The client is too slow to send its request or headers, while the connection is still writable. |
 | `413 Payload Too Large`     | The request body exceeds the 1 MiB size cap (enforced before routing).                        |
 | `500 Internal Server Error` | An unexpected server-side error occurred while handling the request.                          |
+
+**Parser-level rejections.** Some inputs are rejected by Node's built-in HTTP
+parser *before* the request reaches the routing logic above, so they are
+answered without running the method/path checks:
+
+- A request whose method **token is not recognized** by the parser — an
+  arbitrary or non-standard word rather than a known verb such as `GET`,
+  `POST`, `PUT`, `DELETE`, `OPTIONS`, … — is rejected with `400 Bad Request`.
+  Only parser-recognized verbs reach the `405` method check above.
+- A malformed request line or malformed headers are likewise rejected with
+  `400` (as noted in the `400` row above).
+
+This is why the `405` entries above are scoped to methods *recognized by the
+parser*: an unrecognized method token surfaces as `400`, not `405`.
 
 To resist slow-client and denial-of-service patterns, request processing is
 bounded by a request timeout (30s), a headers timeout (20s), and a keep-alive

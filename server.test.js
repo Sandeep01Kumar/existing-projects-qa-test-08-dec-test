@@ -637,6 +637,131 @@ describe('HTTP contract and framing (spawned server)', () => {
     // A client error IS logged, but must be a single sanitized line (no stack).
     await assertNewStderrSafe('raw malformed', /Client error:/);
   });
+
+  // -------------------------------------------------------------------------
+  // Coalesced valid-then-malformed pipeline ordering (ACCEPT-F1)
+  //
+  // A single TCP write carrying a COMPLETE valid request immediately followed
+  // by malformed bytes must NOT let the parser error on the later bytes
+  // suppress the earlier, already-accepted request's response. Node dispatches
+  // the valid request (whose response this server defers until its body drains
+  // at req 'end') and then synchronously emits 'clientError' for the malformed
+  // bytes; the server must preserve/flush the earlier response FIRST and only
+  // then answer the malformed request (400) or close - never write a bare 400
+  // that discards the pending valid response. Regression guard: against the
+  // pre-fix server every one of these returns only [400] with no greeting.
+  // rawExchange writes the whole payload in a single socket.write(), so these
+  // exercise the coalesced same-segment path directly.
+  // -------------------------------------------------------------------------
+
+  it('ACCEPT-F1: coalesced valid GET + malformed preserves the 200 (then 400)', { timeout: TEST_TIMEOUT_MS }, async () => {
+    markStderr();
+    const { raw, responseCount } = await rawExchange(
+      port,
+      'GET / HTTP/1.1\r\nHost: test\r\n\r\nGET / HTTP/1.1\r\nBad Header\r\n\r\n'
+    );
+    assert.match(
+      statusLine(raw),
+      /^HTTP\/1\.1 200 OK$/,
+      `first response must be the earlier valid 200, not the later 400:\n${raw}`
+    );
+    const greetingIdx = raw.indexOf('Hello, World!\n');
+    assert.ok(greetingIdx !== -1, `the valid request's greeting must be preserved:\n${raw}`);
+    assert.strictEqual(
+      raw.split('Hello, World!\n').length - 1,
+      1,
+      `the greeting must appear exactly once:\n${raw}`
+    );
+    const badIdx = raw.indexOf('400 Bad Request');
+    assert.ok(badIdx !== -1, `the later malformed request should still be answered with 400:\n${raw}`);
+    assert.ok(greetingIdx < badIdx, `the 200 greeting must be delivered before the 400:\n${raw}`);
+    assert.strictEqual(responseCount, 2, `expected exactly [200, 400], got ${responseCount} responses:\n${raw}`);
+    // The malformed tail IS a client error: logged once, single sanitized line.
+    await assertNewStderrSafe('coalesced valid+malformed', /Client error:/);
+  });
+
+  it('ACCEPT-F1: coalesced HEAD + malformed preserves the HEAD 200 (then 400)', { timeout: TEST_TIMEOUT_MS }, async () => {
+    markStderr();
+    const { raw, responseCount } = await rawExchange(
+      port,
+      'HEAD / HTTP/1.1\r\nHost: test\r\n\r\nGET / HTTP/1.1\r\nBad Header\r\n\r\n'
+    );
+    assert.match(
+      statusLine(raw),
+      /^HTTP\/1\.1 200 OK$/,
+      `first response must be the earlier valid HEAD 200:\n${raw}`
+    );
+    // HEAD must carry no message body (RFC 9110): the greeting never appears.
+    assert.strictEqual(raw.indexOf('Hello, World!'), -1, `HEAD must not include a body:\n${raw}`);
+    assert.ok(raw.indexOf('400 Bad Request') !== -1, `the later malformed request should be answered with 400:\n${raw}`);
+    assert.strictEqual(responseCount, 2, `expected exactly [200, 400], got ${responseCount}:\n${raw}`);
+    await assertNewStderrSafe('coalesced HEAD+malformed', /Client error:/);
+  });
+
+  it('ACCEPT-F1: coalesced unknown-path (404) + malformed preserves the 404 (then 400)', { timeout: TEST_TIMEOUT_MS }, async () => {
+    markStderr();
+    const { raw, responseCount } = await rawExchange(
+      port,
+      'GET /does-not-exist HTTP/1.1\r\nHost: test\r\n\r\nGET / HTTP/1.1\r\nBad Header\r\n\r\n'
+    );
+    assert.match(
+      statusLine(raw),
+      /^HTTP\/1\.1 404 Not Found$/,
+      `first response must be the earlier valid 404, not the later 400:\n${raw}`
+    );
+    assert.ok(raw.indexOf('400 Bad Request') !== -1, `the later malformed request should be answered with 400:\n${raw}`);
+    assert.strictEqual(responseCount, 2, `expected exactly [404, 400], got ${responseCount}:\n${raw}`);
+    await assertNewStderrSafe('coalesced 404+malformed', /Client error:/);
+  });
+
+  it('ACCEPT-F1: coalesced unsupported-method (405) + malformed preserves the 405 (then 400)', { timeout: TEST_TIMEOUT_MS }, async () => {
+    markStderr();
+    const { raw, responseCount } = await rawExchange(
+      port,
+      'POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nBad Header\r\n\r\n'
+    );
+    assert.match(
+      statusLine(raw),
+      /^HTTP\/1\.1 405 Method Not Allowed$/,
+      `first response must be the earlier valid 405, not the later 400:\n${raw}`
+    );
+    assert.match(raw, /\r\nAllow: GET, HEAD\r\n/, `the 405 must carry Allow: GET, HEAD:\n${raw}`);
+    assert.ok(raw.indexOf('400 Bad Request') !== -1, `the later malformed request should be answered with 400:\n${raw}`);
+    assert.strictEqual(responseCount, 2, `expected exactly [405, 400], got ${responseCount}:\n${raw}`);
+    await assertNewStderrSafe('coalesced 405+malformed', /Client error:/);
+  });
+
+  it('ACCEPT-F1: coalesced two valid GETs + malformed preserves both 200s (then 400)', { timeout: TEST_TIMEOUT_MS }, async () => {
+    markStderr();
+    const { raw, responseCount } = await rawExchange(
+      port,
+      'GET / HTTP/1.1\r\nHost: test\r\n\r\nGET / HTTP/1.1\r\nHost: test\r\n\r\nGET / HTTP/1.1\r\nBad Header\r\n\r\n'
+    );
+    assert.match(statusLine(raw), /^HTTP\/1\.1 200 OK$/, `first response must be a valid 200:\n${raw}`);
+    assert.strictEqual(
+      raw.split('Hello, World!\n').length - 1,
+      2,
+      `both valid greetings must be preserved (exactly twice):\n${raw}`
+    );
+    assert.ok(raw.indexOf('400 Bad Request') !== -1, `the later malformed request should be answered with 400:\n${raw}`);
+    assert.strictEqual(responseCount, 3, `expected exactly [200, 200, 400], got ${responseCount}:\n${raw}`);
+    await assertNewStderrSafe('coalesced two-valid+malformed', /Client error:/);
+  });
+
+  it('ACCEPT-F1: coalesced Connection: close valid GET + malformed still preserves the 200', { timeout: TEST_TIMEOUT_MS }, async () => {
+    markStderr();
+    const { raw } = await rawExchange(
+      port,
+      'GET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\nGET / HTTP/1.1\r\nBad Header\r\n\r\n'
+    );
+    // With Connection: close the server closes after the 200, so the malformed
+    // tail causes closure rather than a written 400 - either is acceptable per
+    // the contract, but the earlier valid 200 must ALWAYS be preserved first.
+    assert.match(statusLine(raw), /^HTTP\/1\.1 200 OK$/, `the valid 200 must be preserved first:\n${raw}`);
+    assert.ok(raw.indexOf('Hello, World!\n') !== -1, `the greeting must be delivered:\n${raw}`);
+    // The malformed tail is still a logged, single-line, stack-free client error.
+    await assertNewStderrSafe('coalesced close+malformed', /Client error:/);
+  });
 });
 
 // ===========================================================================

@@ -150,6 +150,29 @@ const failureLogged = new WeakSet();
 // unmarked. Keyed weakly so entries disappear with their socket.
 const respondedForRequest = new WeakSet();
 
+// Per-socket count of requests that have been ACCEPTED (a ServerResponse
+// exists) but whose response has not yet settled. This underpins the
+// coalesced-pipeline ordering guarantee (ACCEPT-F1): the server-level
+// 'clientError' handler consults it so that a raw 400/408 synthesized for
+// LATER malformed bytes in the same TCP segment is never written ahead of (or
+// in place of) an earlier, already-accepted valid request's still-pending
+// response. Without this, a single write of "GET / <valid>" immediately
+// followed by "<malformed>" made Node dispatch the valid request (whose
+// response this server defers until the body drains at req 'end') and then
+// synchronously emit 'clientError' for the malformed bytes; writing the 400 at
+// that instant half-closed the socket and discarded the pending 200, so the
+// client saw only [400] and never the greeting. Keyed weakly so entries
+// disappear with their socket.
+const inFlightResponses = new WeakMap();
+
+// A client error (parser-malformed -> 400, or a request/headers timeout ->
+// 408) that arrived while a response was still in flight on the socket, held
+// here so flushPendingClientError() can emit it in correct order ONLY after the
+// earlier response(s) have drained ([200] then [400]) instead of racing and
+// suppressing them (ACCEPT-F1). Stores just the classifying error code; keyed
+// weakly so entries disappear with their socket.
+const pendingClientError = new WeakMap();
+
 // Guard that makes shutdown() idempotent so repeated signals never double-run.
 let isShuttingDown = false;
 
@@ -468,6 +491,15 @@ function handleRequest(req, res) {
   // an unexpected throw inside data/end/error/close likewise becomes a
   // controlled 500 (or a safe abandon) rather than a process-fatal exception.
   try {
+    // Coalesced-pipeline ordering (ACCEPT-F1): register this exchange as
+    // in-flight on its socket BEFORE wiring the rest of the listeners, so that
+    // if LATER malformed bytes in the same TCP segment provoke a 'clientError'
+    // while this (already-accepted, valid) request's response is still pending,
+    // the server writes the raw 400/408 only AFTER this response drains rather
+    // than discarding it. The count is decremented automatically when the
+    // response settles.
+    trackInFlightResponse(req.socket, res);
+
     // Stream error listeners prevent an unhandled req/res error (e.g. a client
     // that aborts mid-flight) from crashing the process. A malformed/interrupted
     // request maps to a single safe 400 if we can still write; finalize() also
@@ -644,6 +676,88 @@ function handleConnect(_req, socket) {
 }
 
 // ---------------------------------------------------------------------------
+// Coalesced-pipeline response ordering (ACCEPT-F1)
+//
+// When a client coalesces a valid request and following malformed bytes into a
+// single TCP segment, Node parses and dispatches the valid request (whose
+// response this server defers until the body has drained at req 'end') and
+// then SYNCHRONOUSLY emits 'clientError' for the malformed bytes - before the
+// valid request's deferred response has been written. Writing a raw 400 to the
+// socket at that instant (which also half-closes it) discards the still-pending
+// valid response, so the client sees only [400] and never the 200.
+//
+// These two helpers let the 'clientError' handler DEFER its raw status line
+// until every in-flight response on that socket has settled, after which the
+// 400/408 is appended in correct order ([200] then [400]) and the connection is
+// closed - matching both the original server's response preservation and this
+// server's own behavior when the two requests arrive with any time gap. The
+// mechanism is a per-socket counter plus a one-shot 'close' listener; it never
+// touches the valid-request fast path beyond an O(1) map write and a single
+// listener, so the hard performance constraint is preserved.
+// ---------------------------------------------------------------------------
+
+/**
+ * Record that a response has been accepted on `socket` and will settle
+ * asynchronously, and arrange to decrement that count once the response
+ * closes. When the socket's in-flight count returns to zero, any client error
+ * that was deferred while responses were pending is flushed in correct order.
+ *
+ * @param {import('net').Socket|undefined|null} socket
+ * @param {http.ServerResponse} res
+ */
+function trackInFlightResponse(socket, res) {
+  if (!socket) {
+    return;
+  }
+  inFlightResponses.set(socket, (inFlightResponses.get(socket) || 0) + 1);
+
+  // 'close' is emitted exactly once per ServerResponse. For a normally
+  // completed response it fires AFTER 'finish' (i.e. after the response bytes
+  // have been flushed to the socket), so a deferred 400/408 appended here lands
+  // strictly after the completed response; on an aborted response it still
+  // fires, so the count can never be stranded above zero. Decrement, and once
+  // the socket has no more pending responses, emit any deferred client error.
+  res.once('close', () => {
+    const remaining = (inFlightResponses.get(socket) || 1) - 1;
+    if (remaining > 0) {
+      inFlightResponses.set(socket, remaining);
+      return;
+    }
+    inFlightResponses.delete(socket);
+    flushPendingClientError(socket);
+  });
+}
+
+/**
+ * Emit a previously deferred client-error status line now that every earlier
+ * response on the socket has drained, then close the connection with a FIN. The
+ * status matches the deferred error's classification - 408 for a request/
+ * headers timeout, 400 for parser-malformed input - mirroring the immediate
+ * (non-deferred) paths in the 'clientError' handler. A no-op when nothing was
+ * deferred or the socket is already gone / unwritable.
+ *
+ * @param {import('net').Socket|undefined|null} socket
+ */
+function flushPendingClientError(socket) {
+  if (!socket) {
+    return;
+  }
+  const pending = pendingClientError.get(socket);
+  if (!pending) {
+    return;
+  }
+  pendingClientError.delete(socket);
+  if (socket.destroyed || !socket.writable) {
+    return;
+  }
+  if (pending.code === REQUEST_TIMEOUT_CODE) {
+    socket.end('HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n');
+  } else {
+    socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Server construction and event wiring
 // ---------------------------------------------------------------------------
 
@@ -722,6 +836,33 @@ function createAndConfigureServer() {
     if (err.code === 'ECONNRESET' || !canWrite) {
       if (err.code !== 'ECONNRESET') {
         logConnectionFailureOnce(socket, 'Client error', err);
+      }
+      return;
+    }
+
+    // Coalesced-pipeline ordering guard (ACCEPT-F1): if a response for an
+    // earlier, already-accepted request on this socket is still in flight (the
+    // classic case is a single TCP segment carrying "GET / <valid>" immediately
+    // followed by "<malformed>": Node dispatches the valid request - whose
+    // response is deferred until its body drains at req 'end' - and then
+    // synchronously lands here for the malformed bytes), writing the raw status
+    // line NOW would be injected ahead of, or would half-close the socket and
+    // discard, that pending response, suppressing it entirely. Reaching this
+    // point means the socket is still writable and the error is not a bare
+    // reset, so instead of racing the pending response we DEFER the status line;
+    // flushPendingClientError() emits it in correct order ([200] then [400]/
+    // [408]) and closes the connection once the socket's in-flight responses
+    // have drained. A standalone malformed request never dispatched a 'request'
+    // event (its headers never parsed), so its in-flight count is zero and it
+    // still takes the immediate paths below unchanged.
+    if ((inFlightResponses.get(socket) || 0) > 0) {
+      if (!pendingClientError.has(socket)) {
+        pendingClientError.set(socket, { code: err.code });
+        // Log once now (deduplicated per socket); the deferred flush only
+        // writes bytes, mirroring the immediate paths' "log then respond".
+        const context =
+          err.code === REQUEST_TIMEOUT_CODE ? 'Client request timeout' : 'Client error';
+        logConnectionFailureOnce(socket, context, err);
       }
       return;
     }
