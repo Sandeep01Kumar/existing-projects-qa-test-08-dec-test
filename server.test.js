@@ -798,6 +798,126 @@ describe('timeout enforcement (spawned server)', () => {
 });
 
 // ===========================================================================
+// Timeout enforcement - dispatched slow body (CP3-01 regression, in-process)
+// ===========================================================================
+//
+// A request whose HEADERS complete (so Node dispatches a 'request' event and an
+// in-flight response is registered) but whose BODY then stalls past
+// requestTimeout must still be answered with a 408 AND have its socket released.
+// The original defect deferred that timeout behind the in-flight response - which
+// could never settle for a stalled connection - so the 408 was never sent and
+// the socket/FD leaked indefinitely (a slowloris-style resource-exhaustion
+// vector). The fix routes timeouts past the coalesced-pipeline defer to the
+// immediate answer-and-release path.
+//
+// This test runs IN-PROCESS via the exported createAndConfigureServer with a
+// shortened requestTimeout so it exercises the real handler + 'clientError'
+// wiring quickly (the headers-phase test above already covers the spawned real
+// process). It uses a NON-RECIPROCATING client (allowHalfOpen: true) that
+// ignores the server's FIN and never closes its own half - the adversarial case
+// that, with a bare socket.end(), would strand the server socket in FIN_WAIT_2
+// with the descriptor still held. It therefore asserts BOTH that the 408 is
+// delivered (FIN-first, so a slow-but-reading client still receives it) AND that
+// the server ultimately destroys (releases) the socket, guarding the full fix.
+describe('timeout enforcement - dispatched slow body (CP3-01, in-process)', () => {
+  it(
+    'a dispatched request whose body stalls past requestTimeout is answered 408 and the socket is released (not leaked)',
+    { timeout: TEST_TIMEOUT_MS },
+    async () => {
+      const srv = require('./server.js');
+      const server = srv.createAndConfigureServer();
+      // Shorten the request timeout so the incomplete-request scan fires quickly
+      // while still driving the genuine handler + clientError path. The linger
+      // before force-destroy is a fixed internal, so the socket is released at
+      // roughly requestTimeout + linger.
+      server.requestTimeout = 1500;
+      server.headersTimeout = 1000;
+
+      /** @type {import('net').Socket | undefined} */
+      let serverSocket;
+      server.on('connection', (s) => {
+        if (!serverSocket) {
+          serverSocket = s;
+        }
+      });
+
+      await new Promise((resolve) => server.listen(0, TEST_HOST, resolve));
+      const { port } = server.address();
+
+      try {
+        const result = await new Promise((resolve, reject) => {
+          let got408 = false;
+          const guard = setTimeout(() => {
+            reject(
+              new Error(
+                `timed out waiting for the server to release the stalled socket ` +
+                  `(got408=${got408}, ` +
+                  `serverDestroyed=${Boolean(serverSocket && serverSocket.destroyed)})`
+              )
+            );
+          }, TEST_TIMEOUT_MS - 3000);
+          guard.unref();
+
+          const client = net.connect(
+            { port, host: TEST_HOST, allowHalfOpen: true },
+            () => {
+              // Complete the headers (dispatches the request -> in-flight
+              // response), then send only part of the promised body and stall.
+              client.write('POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n');
+              client.write('0123456789');
+            }
+          );
+          let buf = '';
+          client.on('data', (d) => {
+            buf += d.toString('latin1');
+            if (/^HTTP\/1\.1 408\b/.test(buf)) {
+              got408 = true;
+            }
+          });
+          // A reset after the FIN (the force-destroy) is expected for this
+          // non-reciprocating client; do not fail the test on it.
+          client.on('error', () => {});
+
+          // Resolve when the SERVER releases its own socket (the force-destroy,
+          // or a natural close, fires 'close') - direct proof the FD is freed.
+          const onServerClose = () => {
+            clearTimeout(guard);
+            try {
+              client.destroy();
+            } catch (_) {
+              /* already gone */
+            }
+            resolve({
+              got408,
+              serverDestroyed: Boolean(serverSocket && serverSocket.destroyed),
+            });
+          };
+          const attachServerClose = () => {
+            if (serverSocket) {
+              serverSocket.once('close', onServerClose);
+            } else {
+              setImmediate(attachServerClose);
+            }
+          };
+          attachServerClose();
+        });
+
+        assert.ok(
+          result.got408,
+          'the stalled dispatched request must receive a 408 (delivered via FIN before release)'
+        );
+        assert.ok(
+          result.serverDestroyed,
+          'the server must destroy (release) the stalled socket, not strand it in FIN_WAIT_2'
+        );
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
+      }
+    }
+  );
+});
+
+// ===========================================================================
 // Configuration and startup errors (dedicated children)
 // ===========================================================================
 

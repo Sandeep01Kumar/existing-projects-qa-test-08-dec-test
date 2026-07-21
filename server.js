@@ -93,6 +93,22 @@ const REQUEST_TIMEOUT_MS = 30000; // 30 s - total time to receive a request
 const HEADERS_TIMEOUT_MS = 20000; // 20 s - time to receive the request headers
 const KEEPALIVE_TIMEOUT_MS = 5000; //  5 s - idle keep-alive socket timeout
 
+// Grace period between writing a timed-out client's 408 and forcibly resetting
+// the connection to reclaim its file descriptor (CP3-01). The 408 is written
+// WITHOUT a FIN (the socket stays writable) so the response reaches the client's
+// buffer and is delivered to any slow-but-reading client during this window
+// (SRV-03); only after it elapses is the socket reset (TCP RST), which releases
+// the descriptor at BOTH ends immediately with no lingering FIN_WAIT_2 orphan.
+// A graceful close of end()+destroy() was insufficient here: against a
+// non-reciprocating slowloris peer that never returns its own FIN it strands the
+// server socket in FIN_WAIT_2 with the descriptor still held by the process
+// until the OS timeout (~2 min on Windows) - a bounded but real, exploitable FD
+// hold. This grace bounds a stalled connection's descriptor lifetime to
+// REQUEST_TIMEOUT_MS + this value and then frees it deterministically. A
+// well-behaved client that closes after reading the 408 is released even sooner
+// (its FIN ends the socket before this timer fires).
+const CLIENT_TIMEOUT_LINGER_MS = 5000; // 5 s
+
 // How often (ms) Node scans in-flight connections for headersTimeout /
 // requestTimeout violations. Node's default is 30000, which makes the 20 s
 // headers timeout only actionable at the next 30 s scan boundary (a partial-
@@ -165,12 +181,15 @@ const respondedForRequest = new WeakSet();
 // disappear with their socket.
 const inFlightResponses = new WeakMap();
 
-// A client error (parser-malformed -> 400, or a request/headers timeout ->
-// 408) that arrived while a response was still in flight on the socket, held
-// here so flushPendingClientError() can emit it in correct order ONLY after the
-// earlier response(s) have drained ([200] then [400]) instead of racing and
-// suppressing them (ACCEPT-F1). Stores just the classifying error code; keyed
-// weakly so entries disappear with their socket.
+// A parser-malformed client error (-> 400) that arrived while a response was
+// still in flight on the socket, held here so flushPendingClientError() can
+// emit it in correct order ONLY after the earlier response(s) have drained
+// ([200] then [400]) instead of racing and suppressing them (ACCEPT-F1).
+// Request/headers TIMEOUTS are NOT deferred here - they take the immediate
+// 408-and-close path so a stalled connection is released promptly instead of
+// leaking (CP3-01); flushPendingClientError() keeps a 408 branch only as a
+// defensive fallback that is not reached in practice. Stores just the
+// classifying error code; keyed weakly so entries disappear with their socket.
 const pendingClientError = new WeakMap();
 
 // Guard that makes shutdown() idempotent so repeated signals never double-run.
@@ -730,11 +749,13 @@ function trackInFlightResponse(socket, res) {
 
 /**
  * Emit a previously deferred client-error status line now that every earlier
- * response on the socket has drained, then close the connection with a FIN. The
- * status matches the deferred error's classification - 408 for a request/
- * headers timeout, 400 for parser-malformed input - mirroring the immediate
- * (non-deferred) paths in the 'clientError' handler. A no-op when nothing was
- * deferred or the socket is already gone / unwritable.
+ * response on the socket has drained, then close the connection with a FIN. In
+ * practice only parser-malformed input (400) is ever deferred: request/headers
+ * TIMEOUTS are excluded from the coalesced-pipeline defer (CP3-01) and take the
+ * immediate reset-and-release path instead, so they never reach here. The 408
+ * branch below is therefore retained only as defensive parity with the deferred
+ * error's classification. A no-op when nothing was deferred or the socket is
+ * already gone / unwritable.
  *
  * @param {import('net').Socket|undefined|null} socket
  */
@@ -755,6 +776,56 @@ function flushPendingClientError(socket) {
   } else {
     socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
   }
+}
+
+/**
+ * Answer a timed-out client with 408 and then deterministically release the
+ * socket so a stalled peer cannot hold the file descriptor open (CP3-01).
+ *
+ * The 408 is WRITTEN (not end()'d): the socket is left writable and no FIN is
+ * sent, so the response lands in the client's receive buffer and is delivered to
+ * a slow-but-reading client during the grace window (SRV-03 - the response is
+ * put on the wire before the connection is torn down, never discarded ahead of
+ * delivery). Then, after a bounded, unref'd grace of CLIENT_TIMEOUT_LINGER_MS,
+ * the socket is reset with a TCP RST (resetAndDestroy), which releases the
+ * descriptor at BOTH ends immediately and leaves NO lingering FIN_WAIT_2 orphan.
+ *
+ * A graceful end()+destroy() was deliberately NOT used: against a
+ * non-reciprocating slowloris peer that never returns its own FIN, the FIN from
+ * end() strands the server socket in FIN_WAIT_2 with the process still holding
+ * the descriptor until the OS timeout - a bounded but real, exploitable FD hold.
+ * The RST avoids that entirely. A well-behaved client that closes its own half
+ * after reading the 408 makes the server socket end naturally (the server's
+ * sockets are not half-open), firing 'close' and releasing the FD before this
+ * timer ever fires - so only non-reciprocating peers actually receive the RST.
+ *
+ * The grace timer is unref'd so it never keeps the event loop (or a graceful
+ * shutdown) alive, is cleared if the socket closes first, and its teardown is
+ * guarded so it is a harmless no-op on an already-destroyed socket.
+ *
+ * @param {import('net').Socket} socket - a writable, non-destroyed client socket
+ */
+function answerTimeoutAndRelease(socket) {
+  // Write (do NOT end) so the socket stays writable and the 408 is delivered
+  // without committing the connection to a FIN/FIN_WAIT_2 teardown.
+  socket.write('HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n');
+  const release = setTimeout(() => {
+    if (socket.destroyed) {
+      return;
+    }
+    // Prefer an explicit RST (resetAndDestroy, Node >= 16.17 / 18.3) to release
+    // the descriptor at both ends with no FIN_WAIT_2 orphan; fall back to
+    // destroy() on the (theoretical) older runtime where it is unavailable.
+    if (typeof socket.resetAndDestroy === 'function') {
+      socket.resetAndDestroy();
+    } else {
+      socket.destroy();
+    }
+  }, CLIENT_TIMEOUT_LINGER_MS);
+  // Never let the grace timer hold the process (or a graceful shutdown) open.
+  release.unref();
+  // If the peer closes on its own first, drop the pending reset.
+  socket.once('close', () => clearTimeout(release));
 }
 
 // ---------------------------------------------------------------------------
@@ -840,36 +911,53 @@ function createAndConfigureServer() {
       return;
     }
 
-    // Coalesced-pipeline ordering guard (ACCEPT-F1): if a response for an
-    // earlier, already-accepted request on this socket is still in flight (the
-    // classic case is a single TCP segment carrying "GET / <valid>" immediately
-    // followed by "<malformed>": Node dispatches the valid request - whose
-    // response is deferred until its body drains at req 'end' - and then
-    // synchronously lands here for the malformed bytes), writing the raw status
-    // line NOW would be injected ahead of, or would half-close the socket and
-    // discard, that pending response, suppressing it entirely. Reaching this
-    // point means the socket is still writable and the error is not a bare
-    // reset, so instead of racing the pending response we DEFER the status line;
-    // flushPendingClientError() emits it in correct order ([200] then [400]/
-    // [408]) and closes the connection once the socket's in-flight responses
-    // have drained. A standalone malformed request never dispatched a 'request'
-    // event (its headers never parsed), so its in-flight count is zero and it
-    // still takes the immediate paths below unchanged.
-    if ((inFlightResponses.get(socket) || 0) > 0) {
+    // Coalesced-pipeline ordering guard (ACCEPT-F1) - PARSER-MALFORMED ERRORS
+    // ONLY. If a response for an earlier, already-accepted request on this
+    // socket is still in flight (the classic case is a single TCP segment
+    // carrying "GET / <valid>" immediately followed by "<malformed>": Node
+    // dispatches the valid request - whose response is deferred until its body
+    // drains at req 'end' - and then synchronously lands here for the malformed
+    // bytes), writing the raw status line NOW would be injected ahead of, or
+    // would half-close the socket and discard, that pending response,
+    // suppressing it entirely. Reaching this point means the socket is still
+    // writable and the error is not a bare reset, so instead of racing the
+    // pending response we DEFER the status line; flushPendingClientError()
+    // emits it in correct order ([200] then [400]) and closes the connection
+    // once the socket's in-flight responses have drained. A standalone
+    // malformed request never dispatched a 'request' event (its headers never
+    // parsed), so its in-flight count is zero and it still takes the immediate
+    // paths below unchanged.
+    //
+    // A request/headers TIMEOUT is deliberately EXCLUDED from this defer
+    // (CP3-01): a timeout means the peer has stalled and the connection is
+    // effectively dead, so an in-flight response for that stalled request can
+    // NEVER settle (its body will not arrive) - which means the deferred flush,
+    // which only runs once in-flight responses drain to zero, would never fire
+    // and the socket/FD would leak indefinitely (an exploitable slowloris-
+    // variant, and a regression versus stock Node's send-408-and-close). The
+    // ordering rationale above exists to preserve a still-deliverable response
+    // on a LIVE connection; it does not apply to a dead one. Timeouts therefore
+    // skip the defer and fall through to the immediate 408-and-close path
+    // below, releasing the connection promptly regardless of in-flight state.
+    if (err.code !== REQUEST_TIMEOUT_CODE && (inFlightResponses.get(socket) || 0) > 0) {
       if (!pendingClientError.has(socket)) {
         pendingClientError.set(socket, { code: err.code });
-        // Log once now (deduplicated per socket); the deferred flush only
-        // writes bytes, mirroring the immediate paths' "log then respond".
-        const context =
-          err.code === REQUEST_TIMEOUT_CODE ? 'Client request timeout' : 'Client error';
-        logConnectionFailureOnce(socket, context, err);
+        // Log once now (deduplicated per socket); the deferred flush only writes
+        // bytes, mirroring the immediate paths' "log then respond". Only parser-
+        // malformed errors reach here (timeouts are excluded above), so the
+        // context is always the generic client-error label.
+        logConnectionFailureOnce(socket, 'Client error', err);
       }
       return;
     }
 
     if (err.code === REQUEST_TIMEOUT_CODE) {
       logConnectionFailureOnce(socket, 'Client request timeout', err);
-      socket.end('HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n');
+      // Write the 408 (delivered during a bounded grace, SRV-03) and then reset
+      // the connection so a non-reciprocating stalled peer cannot hold the
+      // descriptor open in FIN_WAIT_2 - releasing the FD deterministically at
+      // both ends (CP3-01).
+      answerTimeoutAndRelease(socket);
       return;
     }
 
