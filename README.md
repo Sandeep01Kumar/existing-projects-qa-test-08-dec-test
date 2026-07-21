@@ -6,8 +6,10 @@ module. This project is created for QA testing.
 The server preserves its original default behavior — a valid `GET /` returns
 `200` with `Content-Type: text/plain` and the body `Hello, World!\n` — while
 adding a specific set of reliability and robustness features: per-request and
-process-level error handling (a `try`/`catch` around request handling,
-`req`/`res` stream-error listeners, listen-error classification, and
+process-level error handling (the entire request callback — handler setup, body
+streaming, and routing — is guarded so that any unexpected error becomes a
+single generic `500` while the response is still writable, alongside `req`/`res`
+stream-error listeners, listen-error classification, and
 `uncaughtException`/`unhandledRejection` safety nets), signal-driven graceful
 shutdown with a bounded force-exit, request validation (allowed methods, path,
 and a request-body size cap), live-connection tracking and cleanup, and
@@ -65,7 +67,7 @@ silently coerced.
 |------------|-------------|----------------------------------------------------------------------------------------------|
 | `PORT`     | `3000`      | TCP port to listen on. Must be an integer in `0`–`65535` (`0` requests an ephemeral OS port). |
 | `HOST`     | `127.0.0.1` | Host / interface to bind. Must be a non-empty string.                                        |
-| `NODE_ENV` | *(unset)*   | When set to `production`, error logs omit stack traces.                                      |
+| `SERVER_DEBUG` | *(unset)* | Diagnostic opt-in. Error logs are single-line and sanitized (no stack traces) by default in **every** environment; set to `1` to additionally include stack traces when debugging locally. |
 
 Example — bind all interfaces on port `8080`:
 
@@ -108,14 +110,19 @@ cap → method → path** — and the first failing check determines the status:
 | `200 OK`                    | `GET /` returns `Content-Type: text/plain` and the body `Hello, World!\n`. `HEAD /` returns the same `200` status and `Content-Type: text/plain` **with no body**; other generated headers may differ (for example `GET` responses are sent with `Transfer-Encoding: chunked`, which `HEAD` does not carry). A query string on `/` (e.g. `/?x=1`) is still the root route. |
 | `400 Bad Request`           | A malformed request line or headers, **while the connection is still writable**. A client that has already disconnected or reset the socket may simply be closed without a response being written. |
 | `404 Not Found`             | An allowed method (`GET`/`HEAD`) on any path other than `/`.                                   |
-| `405 Method Not Allowed`    | Any method other than `GET`/`HEAD`, on any path (the response includes an `Allow` header). Method is validated before path. |
+| `405 Method Not Allowed`    | Any method other than `GET`/`HEAD`, on any path (the response includes an `Allow: GET, HEAD` header). Method is validated before path. This includes the `CONNECT` tunneling method: although HTTP surfaces `CONNECT` through a separate protocol event rather than the normal request handler, the server answers it with the same `405` + `Allow: GET, HEAD` and then closes the connection, so **no** method escapes validation. |
 | `408 Request Timeout`       | The client is too slow to send its request or headers, while the connection is still writable. |
 | `413 Payload Too Large`     | The request body exceeds the 1 MiB size cap (enforced before routing).                        |
 | `500 Internal Server Error` | An unexpected server-side error occurred while handling the request.                          |
 
 To resist slow-client and denial-of-service patterns, request processing is
 bounded by a request timeout (30s), a headers timeout (20s), and a keep-alive
-timeout (5s), together with the 1 MiB request-body cap noted above.
+timeout (5s), together with the 1 MiB request-body cap noted above. These
+timeouts are enforced promptly: the server configures a short
+connection-checking interval so a stalled request or incomplete headers are cut
+off close to their configured limits — for example, partial headers yield a
+`408` near the 20s headers timeout — rather than only at Node's default ~30s
+connection-scan boundary.
 
 ## Graceful shutdown
 
@@ -147,8 +154,11 @@ the graceful drain before the process exits.
 
 ## Testing
 
-The smoke tests use only Node.js built-ins (`node:test` and `node:assert`) and
-live in `server.test.js`. Run them with:
+The tests use only Node.js built-ins (`node:test`, `node:assert`, `http`,
+`net`, and other core modules — no third-party packages) and live in
+`server.test.js`. They cover the HTTP contract and framing, malformed input,
+timeout enforcement, configuration and startup failures, process lifecycle, and
+the exported handlers directly. Run them with:
 
 ```bash
 npm test
