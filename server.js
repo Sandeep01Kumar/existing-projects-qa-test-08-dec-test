@@ -115,6 +115,17 @@ const sockets = new Set();
 // with their socket (SRV-11).
 const failureLogged = new WeakSet();
 
+// Sockets on which a complete HTTP response has already been emitted for the
+// request currently bound to that socket. The server-level 'clientError'
+// handler consults this so it never synthesizes a SECOND response (e.g. a
+// spurious 400 after a 413 for an oversized body that the client then aborted),
+// which would put two responses on one connection - an HTTP/1.1 framing
+// violation with response-desync / request-smuggling potential (SRV-12). The
+// mark is cleared once the request is fully received (req 'end'), so a later
+// request reusing the same keep-alive socket can still receive its own error
+// response. Keyed weakly so entries disappear with their socket.
+const respondedForRequest = new WeakSet();
+
 // Guard that makes shutdown() idempotent so repeated signals never double-run.
 let isShuttingDown = false;
 
@@ -356,6 +367,14 @@ function handleRequest(req, res) {
       } else {
         res.end(body);
       }
+      // A complete response has now been emitted for the request currently on
+      // this socket. Record it so the server-level 'clientError' handler cannot
+      // write a SECOND response for the same request if the client subsequently
+      // aborts a still-draining body (e.g. after a 413) - which would place two
+      // responses on one connection (SRV-12). The mark is cleared on req 'end'.
+      if (req.socket) {
+        respondedForRequest.add(req.socket);
+      }
     } catch (writeErr) {
       // A teardown race (socket vanished mid-write) can still throw; abandon
       // the exchange rather than let the throw escape as an uncaught error.
@@ -443,6 +462,15 @@ function handleRequest(req, res) {
   // (413) is not routed again. The route call is wrapped so an unexpected throw
   // becomes a controlled 500 rather than an uncaught exception.
   req.on('end', () => {
+    // The request has now been fully received. Any response already emitted for
+    // it is no longer "in flight" for HTTP framing, so clear the per-socket
+    // mark: a subsequent request that reuses this keep-alive socket must be able
+    // to receive its own error response (e.g. a legitimate 400/408 from the
+    // 'clientError' handler). Done BEFORE the guard below so it runs even for a
+    // body-capped (413) or already-finalized request (SRV-12).
+    if (req.socket) {
+      respondedForRequest.delete(req.socket);
+    }
     if (state.finalized || state.limitExceeded) {
       return;
     }
@@ -501,6 +529,25 @@ function createAndConfigureServer() {
   //    just error again); routine resets are not logged (SRV-10 / SRV-11).
   httpServer.on('clientError', (err, socket) => {
     const canWrite = Boolean(socket) && socket.writable && !socket.destroyed;
+
+    // Response-desync guard (SRV-12): if a complete response has already been
+    // emitted for the request currently bound to this socket (e.g. a 413 for an
+    // oversized body that the client then aborted, which surfaces here as
+    // HPE_INVALID_EOF_STATE), synthesizing another response would put two HTTP
+    // responses on one connection - a framing violation a proxy could treat as
+    // a response-splitting / request-smuggling primitive. Do NOT write a second
+    // response; instead end our side gracefully with a FIN, which flushes the
+    // already-written response rather than discarding it with an RST (the 413
+    // path deliberately kept the socket writable for exactly this reason,
+    // SRV-03). The connection is then done.
+    if (socket && respondedForRequest.has(socket)) {
+      respondedForRequest.delete(socket);
+      if (canWrite) {
+        socket.end();
+      }
+      return;
+    }
+
     if (err.code === 'ECONNRESET' || !canWrite) {
       if (err.code !== 'ECONNRESET') {
         logConnectionFailureOnce(socket, 'Client error', err);
