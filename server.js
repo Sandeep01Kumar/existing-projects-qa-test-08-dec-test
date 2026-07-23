@@ -1,14 +1,21 @@
 'use strict';
 
 /**
- * server.js - Hardened Node.js core HTTP server.
+ * server.js - Express-based HTTP server with a hardened connection lifecycle.
  *
- * A minimal, dependency-free HTTP server that preserves its original default
- * behavior (a valid `GET /` returns `200 text/plain "Hello, World!\n"`) while
- * adding production-grade reliability and robustness:
+ * This is a small "tutorial" HTTP service that exposes two plaintext endpoints
+ * built with the Express web framework:
  *
- *   1. Error handling      - listen-error classification, a per-request
- *                            try/catch, req/res stream error listeners, and
+ *   GET /              -> 200 text/plain "Hello, World!\n"   (preserved default)
+ *   GET /good-morning  -> 200 text/plain "Good morning\n"    (added endpoint)
+ *
+ * Express (the application/routing layer) is mounted onto a Node.js core
+ * `http.Server` (the connection/lifecycle layer). Splitting responsibilities
+ * this way lets Express own routing, request validation and response framing
+ * while the underlying server keeps the production-grade reliability hardening:
+ *
+ *   1. Error handling      - Express 404 / 500 handlers, req/res stream error
+ *                            listeners, listen-error classification, and
  *                            process-level uncaughtException / unhandledRejection
  *                            safety nets that record a non-zero exit code.
  *   2. Graceful shutdown   - SIGTERM / SIGINT driven drain via server.close()
@@ -16,21 +23,19 @@
  *                            force-exit timer that is armed BEFORE any cleanup
  *                            that could throw, so shutdown can never strand the
  *                            process.
- *   3. Input validation    - method (405), request-target (400 for malformed,
- *                            404 for unknown paths) and body-size (413) checks,
- *                            plus fail-fast validation of HOST / PORT config.
+ *   3. Input validation    - body-size cap (413), method (405 + Allow), and path
+ *                            (404) checks applied in that fixed precedence, plus
+ *                            fail-fast validation of HOST / PORT config.
  *   4. Resource cleanup    - live-socket tracking, bounded body draining, and
  *                            deterministic connection teardown on shutdown.
- *   5. Robust processing   - request / headers / keep-alive timeouts, and
+ *   5. Robust processing    - request / headers / keep-alive timeouts, and
  *                            client-error handling that answers 408 for request
  *                            timeouts and 400 for parser-malformed input.
  *
- * Terminal-state ownership (concurrency safety):
- *   Every request routes all of its writes/destroys through a single guarded
- *   `finalize()` / `abandon()` pair backed by a per-request `finalized` flag.
- *   Exactly one terminal action is ever taken, so independent asynchronous
- *   events (data / end / error / close) can never each attempt their own
- *   response and trip `ERR_HTTP_HEADERS_SENT`.
+ * Validation precedence (a single failing check determines the status):
+ *   body-size cap (413) -> method (405) -> path (404). Method is checked before
+ *   path, so an unsupported method returns 405 on ANY path (never 404); the body
+ *   cap is enforced as the request streams in, before any routing.
  *
  * Exit-code integrity:
  *   A module-level exit code is tracked and only ever escalated (a failure is
@@ -42,26 +47,26 @@
  *   Errors are logged as a single, sanitized `name [code]: message` line in
  *   EVERY environment by default - control and line-break characters are
  *   stripped so an attacker-influenced message cannot inject extra log lines or
- *   terminal escapes, and arbitrary (non-Error) rejection payloads are never
- *   serialized wholesale. Full stack traces (which can leak filesystem paths and
- *   internals) are emitted ONLY behind an explicit diagnostic opt-in
- *   (`SERVER_DEBUG=1`); they are never shown by default, including on a direct
- *   `node server.js` run where NODE_ENV is unset.
+ *   terminal escapes. Full stack traces are emitted ONLY behind an explicit
+ *   diagnostic opt-in (`SERVER_DEBUG=1`).
  *
- * Design constraints (see Agent Action Plan):
- *   - JavaScript / Node.js only, CommonJS, ZERO third-party dependencies
- *     (only the Node core `http` module and the `process` global are used).
+ * Design notes:
+ *   - CommonJS module. The only third-party dependency is Express (added at the
+ *     user's request); everything else uses Node.js built-ins (`http`, the
+ *     `process` global, core timers).
  *   - The valid-request fast path stays minimal with no synchronous blocking,
  *     and every lifecycle timer is unref'd so it never keeps the event loop
- *     alive (hard performance constraint).
- *   - The runnable entry point remains `node server.js` (auto-starts on run).
+ *     alive.
+ *   - The runnable entry point remains `node server.js` (auto-starts on run);
+ *     when the module is instead `require`d (e.g. by the test suite) nothing
+ *     starts - no server, no port, no process/signal handlers.
  */
 
 // ---------------------------------------------------------------------------
-// Dependencies (Node.js built-ins ONLY - the zero-dependency posture is
-// intentional and must be preserved).
+// Dependencies
 // ---------------------------------------------------------------------------
 const http = require('http');
+const express = require('express');
 
 // ---------------------------------------------------------------------------
 // Configuration constants
@@ -94,31 +99,23 @@ const HEADERS_TIMEOUT_MS = 20000; // 20 s - time to receive the request headers
 const KEEPALIVE_TIMEOUT_MS = 5000; //  5 s - idle keep-alive socket timeout
 
 // Grace period between writing a timed-out client's 408 and forcibly resetting
-// the connection to reclaim its file descriptor (CP3-01). The 408 is written
-// WITHOUT a FIN (the socket stays writable) so the response reaches the client's
-// buffer and is delivered to any slow-but-reading client during this window
-// (SRV-03); only after it elapses is the socket reset (TCP RST), which releases
-// the descriptor at BOTH ends immediately with no lingering FIN_WAIT_2 orphan.
-// A graceful close of end()+destroy() was insufficient here: against a
-// non-reciprocating slowloris peer that never returns its own FIN it strands the
-// server socket in FIN_WAIT_2 with the descriptor still held by the process
-// until the OS timeout (~2 min on Windows) - a bounded but real, exploitable FD
-// hold. This grace bounds a stalled connection's descriptor lifetime to
-// REQUEST_TIMEOUT_MS + this value and then frees it deterministically. A
-// well-behaved client that closes after reading the 408 is released even sooner
-// (its FIN ends the socket before this timer fires).
+// the connection to reclaim its file descriptor. The 408 is written WITHOUT a
+// FIN (the socket stays writable) so the response reaches a slow-but-reading
+// client during this window; only after it elapses is the socket destroyed,
+// which releases the descriptor deterministically and avoids a FIN_WAIT_2
+// orphan against a non-reciprocating peer.
 const CLIENT_TIMEOUT_LINGER_MS = 5000; // 5 s
 
 // How often (ms) Node scans in-flight connections for headersTimeout /
-// requestTimeout violations. Node's default is 30000, which makes the 20 s
-// headers timeout only actionable at the next 30 s scan boundary (a partial-
-// header client was observed to be dropped at ~30 s, not ~20 s - SRV-FINAL-05).
-// A smaller interval enforces the configured header/request timeouts close to
-// their real values. It is a periodic background scan that never touches the
-// request fast path, so the hard performance constraint is preserved.
+// requestTimeout violations. Node's default is 30000, which would make the 20 s
+// headers timeout only actionable at the next 30 s scan boundary. A smaller
+// interval enforces the configured header/request timeouts close to their real
+// values. It is a periodic background scan that never touches the request fast
+// path, so the performance constraint is preserved.
 const CONNECTIONS_CHECKING_INTERVAL_MS = 2000; // 2 s
 
-// Only safe, side-effect-free methods are served by this endpoint.
+// Only safe, side-effect-free methods are served by this API. HEAD is accepted
+// and handled by Express's GET routes (the body is stripped automatically).
 const ALLOWED_METHODS = ['GET', 'HEAD'];
 
 // Node surfaces request/header timeouts to 'clientError' with this code; it is
@@ -127,10 +124,16 @@ const REQUEST_TIMEOUT_CODE = 'ERR_HTTP_REQUEST_TIMEOUT';
 
 // Stack traces can leak filesystem paths and internal details (CWE-532), so
 // they are NEVER emitted by default in any environment. They are included only
-// when an operator explicitly opts in with `SERVER_DEBUG=1`. The previous
-// NODE_ENV-based rule leaked stacks whenever NODE_ENV was unset (the common
-// direct-run case); default-safe logging is now the invariant (SRV-FINAL-02).
+// when an operator explicitly opts in with `SERVER_DEBUG=1`.
 const SHOW_STACK = process.env.SERVER_DEBUG === '1';
+
+// Response bodies - single source of truth so the routes and the tests agree.
+// The trailing newline on both preserves the original "Hello, World!\n" style.
+const HELLO_BODY = 'Hello, World!\n';
+const GOOD_MORNING_BODY = 'Good morning\n';
+
+// The path of the added greeting endpoint.
+const GOOD_MORNING_PATH = '/good-morning';
 
 // ---------------------------------------------------------------------------
 // Module-level runtime state
@@ -143,65 +146,19 @@ const sockets = new Set();
 // Sockets whose connection-level failure has already been logged, so a single
 // underlying reset/abort is not logged twice by overlapping listeners
 // (clientError vs req/res stream 'error'). Keyed weakly so entries disappear
-// with their socket (SRV-11).
+// with their socket.
 const failureLogged = new WeakSet();
-
-// Sockets on which a complete HTTP response was emitted for the request
-// currently bound to that socket *before that request had fully arrived* (an
-// early 413 body-cap rejection or a request-stream 400). The server-level
-// 'clientError' handler consults this so it never synthesizes a SECOND
-// response (e.g. a spurious 400 after a 413 for an oversized body that the
-// client then aborted), which would put two responses on one connection - an
-// HTTP/1.1 framing violation with response-desync / request-smuggling
-// potential (SRV-12).
-//
-// Only PRE-COMPLETION responses are ever marked. A normal response emitted
-// AFTER the request has fully arrived (a routed 200/404/405/500 produced from
-// the req 'end' handler) is deliberately NOT marked: its request is already
-// complete, so no second response can be provoked for it, and marking it would
-// leave a stale per-socket flag that survives keep-alive reuse and suppress a
-// legitimate 400/408 (and its error log) on the NEXT request over that socket
-// (SRV-REG-01). The mark is cleared on 'end', 'close', and in 'clientError'
-// itself, so a later request reusing the same keep-alive socket always starts
-// unmarked. Keyed weakly so entries disappear with their socket.
-const respondedForRequest = new WeakSet();
-
-// Per-socket count of requests that have been ACCEPTED (a ServerResponse
-// exists) but whose response has not yet settled. This underpins the
-// coalesced-pipeline ordering guarantee (ACCEPT-F1): the server-level
-// 'clientError' handler consults it so that a raw 400/408 synthesized for
-// LATER malformed bytes in the same TCP segment is never written ahead of (or
-// in place of) an earlier, already-accepted valid request's still-pending
-// response. Without this, a single write of "GET / <valid>" immediately
-// followed by "<malformed>" made Node dispatch the valid request (whose
-// response this server defers until the body drains at req 'end') and then
-// synchronously emit 'clientError' for the malformed bytes; writing the 400 at
-// that instant half-closed the socket and discarded the pending 200, so the
-// client saw only [400] and never the greeting. Keyed weakly so entries
-// disappear with their socket.
-const inFlightResponses = new WeakMap();
-
-// A parser-malformed client error (-> 400) that arrived while a response was
-// still in flight on the socket, held here so flushPendingClientError() can
-// emit it in correct order ONLY after the earlier response(s) have drained
-// ([200] then [400]) instead of racing and suppressing them (ACCEPT-F1).
-// Request/headers TIMEOUTS are NOT deferred here - they take the immediate
-// 408-and-close path so a stalled connection is released promptly instead of
-// leaking (CP3-01); flushPendingClientError() keeps a 408 branch only as a
-// defensive fallback that is not reached in practice. Stores just the
-// classifying error code; keyed weakly so entries disappear with their socket.
-const pendingClientError = new WeakMap();
 
 // Guard that makes shutdown() idempotent so repeated signals never double-run.
 let isShuttingDown = false;
 
 // Becomes true once the server has successfully begun listening. Used to
 // distinguish bind/startup errors (no resources to clean up) from runtime
-// errors that occur after the server is live (SRV-04).
+// errors that occur after the server is live.
 let hasListened = false;
 
 // The process exit code, only ever escalated upward (a recorded failure is
-// never downgraded back to success). See requestExit / finalizeExit (SRV-05).
+// never downgraded back to success). See requestExit / finalizeExit.
 let exitCode = 0;
 
 // Ensures the process exits exactly once, with the final recorded code.
@@ -214,9 +171,8 @@ let exitFinalized = false;
 /**
  * Collapse a value to a single safe log token: coerce to string and replace CR,
  * LF, tab and every other C0/C1 control character with a single space. This
- * prevents an attacker-influenced value (e.g. an error message derived from
- * request input) from injecting extra log lines or terminal escape sequences
- * into the log stream - i.e. log-forging / amplification (CWE-117 / CWE-532).
+ * prevents an attacker-influenced value from injecting extra log lines or
+ * terminal escape sequences into the log stream (CWE-117 / CWE-532).
  *
  * @param {unknown} value
  * @returns {string}
@@ -231,10 +187,9 @@ function sanitizeLogValue(value) {
  *
  * Includes the error's name, code (if any) and message - each individually
  * sanitized to a single line - but NOT its stack trace unless the explicit
- * diagnostic opt-in `SERVER_DEBUG=1` is set, since stack traces can leak
- * filesystem paths and internals (CWE-532). Arbitrary non-Error values (e.g. a
- * rejected non-Error) are described by type only; their raw payload is never
- * serialized wholesale as it may contain secrets or PII.
+ * diagnostic opt-in `SERVER_DEBUG=1` is set. Arbitrary non-Error values are
+ * described by type only; their raw payload is never serialized wholesale as it
+ * may contain secrets or PII.
  *
  * @param {unknown} err
  * @returns {string}
@@ -244,8 +199,7 @@ function describeError(err) {
     const code = err.code ? ` [${sanitizeLogValue(err.code)}]` : '';
     const base = `${sanitizeLogValue(err.name)}${code}: ${sanitizeLogValue(err.message)}`;
     // The stack is the ONE place multi-line output is permitted, and only under
-    // the explicit SERVER_DEBUG=1 opt-in. It is intentionally NOT sanitized so a
-    // diagnosing operator sees the real frames; it is never emitted by default.
+    // the explicit SERVER_DEBUG=1 opt-in. It is never emitted by default.
     return SHOW_STACK && err.stack ? `${base}\n${err.stack}` : base;
   }
   // Non-Error rejection/throw value: report only its type, never its content.
@@ -254,9 +208,8 @@ function describeError(err) {
 
 /**
  * Log a connection-level failure at most once per underlying socket, so a
- * single reset/abort observed by multiple overlapping listeners (server
- * 'clientError' and the request/response stream 'error') does not produce
- * duplicate, attacker-amplifiable log lines (SRV-11).
+ * single reset/abort observed by multiple overlapping listeners does not
+ * produce duplicate, attacker-amplifiable log lines.
  *
  * @param {import('net').Socket|undefined|null} socket
  * @param {string} context
@@ -279,7 +232,7 @@ function logConnectionFailureOnce(socket, context, err) {
 /**
  * Report a fatal configuration error and terminate the process non-zero.
  * Called before the server begins listening, so there are no resources to
- * clean up - failing fast here is correct (SRV-01 / SRV-05).
+ * clean up - failing fast here is correct.
  *
  * @param {string} message - sanitized, human-readable reason
  * @returns {never}
@@ -294,18 +247,16 @@ function configurationError(message) {
  * original defaults so behavior is identical when no variables are set.
  *
  * Invalid values are rejected fast with a sanitized diagnostic and a non-zero
- * exit rather than being silently coerced (the legacy `Number(x) || 3000`
- * turned `abc`, whitespace and `0` into 3000) or deferred to a later
- * `listen()` crash (negative / fractional / out-of-range values threw
- * ERR_SOCKET_BAD_PORT). See SRV-01.
+ * exit rather than being silently coerced or deferred to a later listen()
+ * crash.
  *
  * @returns {{ hostname: string, port: number }}
  */
 function loadConfiguration() {
   // HOST: default to loopback. A provided value is trimmed; empty or
   // control-character values are rejected. Any other non-empty string is
-  // accepted as-is (valid DNS names and IPv4/IPv6 literals are not
-  // second-guessed here - the OS resolver validates them at listen time).
+  // accepted as-is (the OS resolver validates DNS names / IP literals at listen
+  // time).
   let hostname = DEFAULT_HOST;
   if (process.env.HOST !== undefined) {
     const rawHost = process.env.HOST.trim();
@@ -318,8 +269,8 @@ function loadConfiguration() {
 
   // PORT: default to 3000. A provided value must be an explicit run of decimal
   // digits (this rejects '', whitespace-only, '1.5', '-1', '0x10', 'abc' and
-  // 'Infinity') that parses to an integer within [0, 65535]. Port 0 is
-  // accepted deliberately (ephemeral port).
+  // 'Infinity') that parses to an integer within [0, 65535]. Port 0 is accepted
+  // deliberately (ephemeral port).
   let port = DEFAULT_PORT;
   if (process.env.PORT !== undefined) {
     const rawPort = process.env.PORT.trim();
@@ -334,334 +285,239 @@ function loadConfiguration() {
 }
 
 // ---------------------------------------------------------------------------
-// Request routing
+// Express application
 //
-// Routing decisions are made only after the request body has been safely
-// consumed (see handleRequest). Order of checks: method -> target -> fast path.
-// Every response is emitted through the guarded `finalize` helper so exactly
-// one terminal action is taken per request.
+// The app is organized as a short, ordered middleware pipeline that enforces
+// the documented validation precedence (body-size cap -> method -> path) before
+// the route handlers run, followed by a 404 catch-all and a 500 error handler.
+// Each concern is a small, single-responsibility function.
 // ---------------------------------------------------------------------------
 
 /**
- * Emit a generic 500 response for an unexpected server-side error without
- * leaking internal details to the client. Routed through the guarded
- * `finalize` helper, so it safely destroys the response if headers were
- * already sent.
+ * Send a plaintext response through Express. Centralizes the status/type/body
+ * pattern so every response is emitted the same way. Express strips the body
+ * for HEAD requests automatically while still reporting Content-Length.
  *
- * @param {(status: number, headers: object, body?: string) => void} finalize
- * @param {unknown} err
+ * @param {import('express').Response} res
+ * @param {number} status
+ * @param {string} body
  */
-function sendServerError(finalize, err) {
-  console.error(`Unhandled error while processing request: ${describeError(err)}`);
-  finalize(500, { 'Content-Type': 'text/plain' }, 'Internal Server Error');
+function sendPlainText(res, status, body) {
+  res.status(status).type('text/plain').send(body);
 }
 
 /**
- * Validate and route a fully-received request.
+ * Middleware: enforce the request-body size cap and drain the body.
  *
- * @param {http.IncomingMessage} req
- * @param {http.ServerResponse} res
- * @param {(status: number, headers: object, body?: string) => void} finalize
- */
-function routeRequest(req, res, finalize) {
-  // Input validation: reject unsupported methods with 405 + Allow.
-  if (!ALLOWED_METHODS.includes(req.method)) {
-    finalize(
-      405,
-      { 'Content-Type': 'text/plain', Allow: ALLOWED_METHODS.join(', ') },
-      'Method Not Allowed'
-    );
-    return;
-  }
-
-  // Input validation (SRV-07): the request target must be a non-empty string.
-  // A malformed request object (missing/empty/non-string url) gets one safe,
-  // generic 400 rather than being treated as root or throwing on `.split`.
-  const target = req.url;
-  if (typeof target !== 'string' || target.length === 0) {
-    finalize(400, { 'Content-Type': 'text/plain' }, 'Bad Request');
-    return;
-  }
-
-  // Only the root path is served. A query string such as "/?x=1" still
-  // resolves to the root "/"; anything else is 404 (behavior unchanged).
-  const pathname = target.split('?')[0];
-  if (pathname !== '/') {
-    finalize(404, { 'Content-Type': 'text/plain' }, 'Not Found');
-    return;
-  }
-
-  // Preserved default behavior - the backward-compatible fast path. A valid
-  // GET / returns exactly: 200, Content-Type: text/plain, body
-  // "Hello, World!\n". HEAD returns the same status/headers with no body per
-  // RFC 9110 (a message body must not be sent in a response to HEAD).
-  const body = req.method === 'HEAD' ? undefined : 'Hello, World!\n';
-  finalize(200, { 'Content-Type': 'text/plain' }, body);
-}
-
-// ---------------------------------------------------------------------------
-// Request handler
-//
-// Owns per-request terminal state so exactly one terminal action (a full
-// response or a destroy) is ever taken, enforces the body-size cap as data
-// streams in (never buffering unbounded data), and routes the request only
-// once its body has been fully and safely consumed.
-// ---------------------------------------------------------------------------
-
-/**
- * Top-level request handler wired into http.createServer.
+ * Bytes are counted as they stream in and the request is rejected with 413 the
+ * moment the cap is exceeded - before any unbounded buffering (DoS mitigation).
+ * Reading the stream to its 'end' also drains within-limit bodies so keep-alive
+ * sockets release cleanly, and only then is `next()` called so routing always
+ * runs against a fully-consumed request. Per-request req/res stream error
+ * listeners are attached here (the first middleware) so an aborted/interrupted
+ * connection can never escape as an unhandled stream 'error' and crash the
+ * process.
  *
- * @param {http.IncomingMessage} req
- * @param {http.ServerResponse} res
+ * @param {import('express').Request} req
+ * @param {import('express').Response} res
+ * @param {import('express').NextFunction} next
  */
-function handleRequest(req, res) {
-  // Single owner of terminal state for this exchange. `finalized` flips to true
-  // the instant any terminal action begins, and every guarded helper below
-  // no-ops afterwards - eliminating the CWE-367 races where independent async
-  // events (data / end / error / close) each tried to respond (SRV-02).
-  // `ended` flips to true the moment the request has fully arrived (req 'end'),
-  // and is used by finalize() to distinguish an EARLY (pre-completion) response
-  // - which must be recorded on the socket to block a duplicate clientError
-  // response (SRV-12) - from a normal post-completion routed response, which
-  // must NOT be recorded or it would strand a stale mark across keep-alive
-  // reuse and suppress the next connection's 400/408 (SRV-REG-01).
-  const state = { finalized: false, limitExceeded: false, ended: false };
-
-  /**
-   * Guarded terminal write: emit a full response exactly once. If the request
-   * is already terminal, or the response can no longer be written cleanly
-   * (headers sent / already ended / destroyed), the socket is destroyed
-   * instead of attempting an illegal second write.
-   *
-   * @param {number} statusCode
-   * @param {object} headers
-   * @param {string} [body]
-   */
-  const finalize = (statusCode, headers, body) => {
-    if (state.finalized) {
-      return;
-    }
-    state.finalized = true;
-
-    if (res.headersSent || res.writableEnded || res.destroyed) {
-      if (!res.destroyed) {
-        res.destroy();
+function enforceBodyLimit(req, res, next) {
+  // Stream error listeners: a client that aborts mid-flight surfaces as a req
+  // (or res) 'error'; log it once and clean up rather than crash. A best-effort
+  // 400 is attempted only while the response is still writable.
+  req.on('error', (err) => {
+    logConnectionFailureOnce(req.socket, 'Request stream error', err);
+    if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+      try {
+        sendPlainText(res, 400, 'Bad Request');
+      } catch (writeErr) {
+        if (!res.destroyed) {
+          res.destroy();
+        }
       }
-      return;
+    } else if (!res.destroyed) {
+      res.destroy();
     }
+  });
 
-    // If this response is being emitted BEFORE the request has fully arrived
-    // (an early 413 body-cap rejection, or a request-stream 400), record it on
-    // the socket so the server-level 'clientError' handler will not synthesize
-    // a SECOND response for this same in-flight request should the client then
-    // abort the still-draining body - two responses on one connection is an
-    // HTTP/1.1 framing violation with response-desync potential (SRV-12). The
-    // mark is set BEFORE the terminal write to close any re-entrancy window,
-    // and ONLY for pre-completion responses (!state.ended): a normal
-    // post-'end' routed 200/404/405/500 is never marked, or the stale flag
-    // would survive keep-alive reuse and suppress a legitimate 400/408 (and its
-    // error log) on the next request over this socket (SRV-REG-01). The mark is
-    // cleared on req 'end', req 'close', and within the clientError handler.
-    if (!state.ended && req.socket) {
-      respondedForRequest.add(req.socket);
-    }
-
-    try {
-      res.writeHead(statusCode, headers);
-      if (body === undefined) {
-        res.end();
-      } else {
-        res.end(body);
-      }
-    } catch (writeErr) {
-      // A teardown race (socket vanished mid-write) can still throw; abandon
-      // the exchange rather than let the throw escape as an uncaught error.
-      logConnectionFailureOnce(req.socket, 'Response write failed', writeErr);
-      if (!res.destroyed) {
-        res.destroy();
-      }
-    }
-  };
-
-  /**
-   * Guarded terminal abandon: mark the exchange terminal and destroy the
-   * response exactly once, without attempting to write anything.
-   */
-  const abandon = () => {
-    if (state.finalized) {
-      return;
-    }
-    state.finalized = true;
+  res.on('error', (err) => {
+    logConnectionFailureOnce(res.socket, 'Response stream error', err);
     if (!res.destroyed) {
       res.destroy();
     }
+  });
+
+  let received = 0;
+  let rejected = false;
+  let advanced = false;
+
+  const proceed = () => {
+    if (advanced || rejected) {
+      return;
+    }
+    advanced = true;
+    next();
   };
 
-  // Top-level request-callback error boundary (SRV-FINAL-03). Wiring up the
-  // per-request listeners below is the request "setup"; a synchronous failure
-  // here (e.g. a malformed request object whose property access or listener
-  // registration throws) is converted into a single generic 500 - when the
-  // response is still writable - routed through the one terminal-state owner
-  // (finalize), instead of escaping as an uncaughtException that would force a
-  // full process shutdown and reset the client with ECONNRESET. Because
-  // finalize()/abandon() are defined above (they cannot throw) and finalize is
-  // idempotent, this 500 can never become a duplicate response. Each individual
-  // asynchronous callback is additionally guarded below with its own catch, so
-  // an unexpected throw inside data/end/error/close likewise becomes a
-  // controlled 500 (or a safe abandon) rather than a process-fatal exception.
+  req.on('data', (chunk) => {
+    if (rejected) {
+      return;
+    }
+    received += chunk.length;
+    if (received > MAX_BODY_SIZE) {
+      rejected = true;
+      // Emit one observable 413 and keep the connection writable so the 413 is
+      // reliably delivered even to a slow/paused client (an RST here would
+      // discard it). The remainder of the (already counted, never buffered)
+      // oversized body is drained via resume(); each discarded chunk is O(1)
+      // memory and draining is bounded by the configured request/keep-alive
+      // timeouts, so an endless body cannot hold the connection open forever.
+      if (!res.headersSent) {
+        sendPlainText(res, 413, 'Payload Too Large');
+      }
+      req.resume();
+    }
+  });
+
+  req.on('end', proceed);
+
+  // A request whose stream closes without a normal 'end' (client abort) is
+  // handled by the 'error'/'close' paths; nothing to route in that case.
+  req.on('close', () => {
+    // If the request closed cleanly after 'end', proceed() already ran; this is
+    // a no-op then. If it closed early (abort), routing must not run.
+    if (!advanced && !rejected && (req.destroyed || req.complete === false)) {
+      rejected = true;
+    }
+  });
+}
+
+/**
+ * Middleware: allow only the safe methods (GET / HEAD). Any other
+ * parser-recognized method is answered with 405 and an `Allow` header, on ANY
+ * path - method is validated before path, so `POST /` and `POST /anything`
+ * both return 405 (never 404). Method tokens the HTTP parser does not
+ * recognize never reach here: Node rejects them with 400 at the parser level.
+ *
+ * @param {import('express').Request} req
+ * @param {import('express').Response} res
+ * @param {import('express').NextFunction} next
+ */
+function methodGuard(req, res, next) {
+  if (!ALLOWED_METHODS.includes(req.method)) {
+    res.set('Allow', ALLOWED_METHODS.join(', '));
+    sendPlainText(res, 405, 'Method Not Allowed');
+    return;
+  }
+  next();
+}
+
+/**
+ * Route handler: the preserved default. A valid `GET /` returns exactly 200,
+ * Content-Type text/plain, body "Hello, World!\n". `HEAD /` returns the same
+ * status/headers with no body (Express strips it).
+ */
+function helloHandler(req, res) {
+  sendPlainText(res, 200, HELLO_BODY);
+}
+
+/**
+ * Route handler: the added greeting. `GET /good-morning` returns 200,
+ * Content-Type text/plain, body "Good morning\n" (HEAD returns headers only).
+ */
+function goodMorningHandler(req, res) {
+  sendPlainText(res, 200, GOOD_MORNING_BODY);
+}
+
+/**
+ * Middleware: 404 catch-all for an allowed method on any unknown path. Runs
+ * only after methodGuard, so it is only ever reached by GET/HEAD requests.
+ */
+function notFoundHandler(req, res) {
+  sendPlainText(res, 404, 'Not Found');
+}
+
+/**
+ * Express error-handling middleware (must take four arguments): convert any
+ * unexpected downstream throw into a single generic 500 while the response is
+ * still writable, without leaking internal details to the client. If headers
+ * were already sent, the response is destroyed instead of attempting an illegal
+ * second write.
+ *
+ * @param {unknown} err
+ * @param {import('express').Request} req
+ * @param {import('express').Response} res
+ * @param {import('express').NextFunction} next
+ */
+// eslint-disable-next-line no-unused-vars
+function errorHandler(err, req, res, next) {
+  console.error(`Unhandled error while processing request: ${describeError(err)}`);
+  if (res.headersSent || res.writableEnded) {
+    if (!res.destroyed) {
+      res.destroy();
+    }
+    return;
+  }
   try {
-    // Coalesced-pipeline ordering (ACCEPT-F1): register this exchange as
-    // in-flight on its socket BEFORE wiring the rest of the listeners, so that
-    // if LATER malformed bytes in the same TCP segment provoke a 'clientError'
-    // while this (already-accepted, valid) request's response is still pending,
-    // the server writes the raw 400/408 only AFTER this response drains rather
-    // than discarding it. The count is decremented automatically when the
-    // response settles.
-    trackInFlightResponse(req.socket, res);
-
-    // Stream error listeners prevent an unhandled req/res error (e.g. a client
-    // that aborts mid-flight) from crashing the process. A malformed/interrupted
-    // request maps to a single safe 400 if we can still write; finalize() also
-    // guarantees a later 'end' cannot route and respond a second time (SRV-02).
-    req.on('error', (err) => {
-      try {
-        logConnectionFailureOnce(req.socket, 'Request stream error', err);
-        finalize(400, { 'Content-Type': 'text/plain' }, 'Bad Request');
-      } catch (cbErr) {
-        // The stream is already in error; a clean response is impossible, so
-        // just mark the exchange terminal rather than let the throw escape.
-        abandon();
-      }
-    });
-
-    res.on('error', (err) => {
-      try {
-        logConnectionFailureOnce(res.socket, 'Response stream error', err);
-      } finally {
-        // Always mark terminal on a response-stream error, even if logging threw.
-        abandon();
-      }
-    });
-
-    // If the request stream closes before a complete message was received (a
-    // client abort/reset), mark the exchange terminal so a trailing event cannot
-    // attempt a second response. No response is attempted or logged here - the
-    // 'error' handler owns any failure logging for this connection (SRV-11).
-    req.on('close', () => {
-      try {
-        // The request is over: clear any early-response mark for this socket so a
-        // subsequent request reusing this keep-alive connection starts unmarked
-        // and can receive its own error response (SRV-REG-01 / SRV-12).
-        if (req.socket) {
-          respondedForRequest.delete(req.socket);
-        }
-        if (!state.finalized && (req.destroyed || req.complete === false)) {
-          abandon();
-        }
-      } catch (cbErr) {
-        abandon();
-      }
-    });
-
-    // Body-size enforcement (cross-cutting DoS guard). Bytes are counted as they
-    // arrive and the request is rejected the moment the cap is exceeded, before
-    // any unbounded buffering. Attaching a 'data' listener also drains the body
-    // for normal (within-limit) requests so keep-alive sockets release cleanly.
-    let received = 0;
-    req.on('data', (chunk) => {
-      try {
-        if (state.finalized || state.limitExceeded) {
-          return;
-        }
-        received += chunk.length;
-        if (received > MAX_BODY_SIZE) {
-          state.limitExceeded = true;
-
-          // Emit one observable 413 and keep the connection alive so the
-          // remainder of the (already counted, never buffered) oversized body
-          // drains through the still-attached 'data' listener. This is
-          // deliberate:
-          //   * We do NOT set `Connection: close` or destroy the socket here.
-          //     Forcing the socket shut while inbound body bytes are still
-          //     unread makes TCP emit an RST, and an RST discards the
-          //     just-written 413 from a slow/paused client's receive buffer -
-          //     which is exactly how the previous implementation turned the 413
-          //     into a bare ECONNRESET (SRV-03). Draining to 'end' and letting
-          //     the keep-alive socket close normally yields a graceful FIN, so
-          //     the 413 is reliably observed by clients that read the response
-          //     late.
-          //   * Draining never buffers (each discarded chunk is O(1) memory) and
-          //     is bounded by the configured requestTimeout / keepAliveTimeout,
-          //     so an endless body cannot hold the connection open indefinitely.
-          // Subsequent 'data' events are ignored by the guard above while the
-          // stream stays in flowing mode, so the body is discarded automatically
-          // - no pause() and no premature destroy().
-          finalize(413, { 'Content-Type': 'text/plain' }, 'Payload Too Large');
-        }
-      } catch (cbErr) {
-        // An unexpected failure while measuring/rejecting the body becomes a
-        // controlled 500 (idempotent) rather than an uncaught exception.
-        sendServerError(finalize, cbErr);
-      }
-    });
-
-    // The body has been fully and safely consumed: route the request. Guarded by
-    // terminal state so a request that already failed (error) or was rejected
-    // (413) is not routed again. The route call is wrapped so an unexpected throw
-    // becomes a controlled 500 rather than an uncaught exception.
-    req.on('end', () => {
-      try {
-        // The request has now been fully received. Flip `ended` FIRST - before
-        // the route call below - so the response routeRequest() emits is treated
-        // as a normal post-completion response and is NOT recorded on the socket
-        // by finalize(); recording it would strand a stale mark that suppresses a
-        // legitimate 400/408 on the next request reusing this keep-alive socket
-        // (SRV-REG-01).
-        state.ended = true;
-        // Clear any early-response mark (e.g. from a 413 whose oversized body has
-        // now fully drained): the request is complete, so a subsequent request
-        // that reuses this keep-alive socket must start unmarked and be able to
-        // receive its own error response (SRV-12). Done BEFORE the guard below so
-        // it runs even for a body-capped (413) or already-finalized request.
-        if (req.socket) {
-          respondedForRequest.delete(req.socket);
-        }
-        if (state.finalized || state.limitExceeded) {
-          return;
-        }
-        routeRequest(req, res, finalize);
-      } catch (err) {
-        sendServerError(finalize, err);
-      }
-    });
-  } catch (setupErr) {
-    // The synchronous listener wiring above threw. Convert it to a generic 500
-    // when the response is still writable; finalize() safely destroys the
-    // response instead if headers were already sent. This is the outer boundary
-    // that closes the SRV-FINAL-03 gap where a setup-time failure previously
-    // escaped to uncaughtException, forced a shutdown, and reset the client.
-    sendServerError(finalize, setupErr);
+    sendPlainText(res, 500, 'Internal Server Error');
+  } catch (writeErr) {
+    if (!res.destroyed) {
+      res.destroy();
+    }
   }
 }
+
+/**
+ * Build and return the Express application. Creating an app has no I/O side
+ * effects (no server, no port, no process listeners), so this is safe to call
+ * from tests and at module load.
+ *
+ * @returns {import('express').Express}
+ */
+function createApp() {
+  const app = express();
+
+  // Do not advertise the framework, and keep responses byte-minimal (no ETag /
+  // conditional-request machinery on these tiny plaintext bodies).
+  app.disable('x-powered-by');
+  app.disable('etag');
+
+  // Validation precedence: body-size cap -> method -> path.
+  app.use(enforceBodyLimit);
+  app.use(methodGuard);
+
+  // Routes. app.get also serves HEAD for the same path (body stripped).
+  app.get('/', helloHandler);
+  app.get(GOOD_MORNING_PATH, goodMorningHandler);
+
+  // Unknown path (for an allowed method) -> 404.
+  app.use(notFoundHandler);
+
+  // Unexpected server-side error -> 500.
+  app.use(errorHandler);
+
+  return app;
+}
+
+// The singleton application used by the running server. Exported for tests.
+const app = createApp();
 
 // ---------------------------------------------------------------------------
 // CONNECT handling
 //
 // Node dispatches a CONNECT request through the special 'connect' event, NOT
-// through the ordinary 'request' event, so it bypasses handleRequest entirely.
-// With no 'connect' listener the tunnel request received NO response at all
-// (SRV-FINAL-01). This handler answers CONNECT with exactly the same ordinary
-// contract as any other unsupported method - a single 405 Method Not Allowed
-// carrying the Allow header - written directly to the raw tunnel socket (a
-// 'connect' event has no ServerResponse), then closes the connection.
+// through the ordinary request pipeline, so it bypasses the Express app. Answer
+// it with the same contract as any other unsupported method - a single 405
+// Method Not Allowed carrying the Allow header - written directly to the raw
+// tunnel socket, then close the connection.
 // ---------------------------------------------------------------------------
 
 /**
  * Reject a CONNECT tunnel request with a single 405 Method Not Allowed that
  * carries the ordinary `Allow` contract, then close the socket. Guarded so a
  * socket that is already gone / unwritable is simply destroyed and a teardown
- * race can never escape as an uncaught error. Like an ordinary 405 this is a
- * normal, expected rejection and is therefore not logged.
+ * race can never escape as an uncaught error.
  *
  * @param {http.IncomingMessage} _req  - the CONNECT request (unused)
  * @param {import('net').Socket} socket - the raw tunnel socket
@@ -670,19 +526,18 @@ function handleConnect(_req, socket) {
   if (!socket) {
     return;
   }
-  const body = 'Method Not Allowed';
-  const response =
-    'HTTP/1.1 405 Method Not Allowed\r\n' +
-    `Allow: ${ALLOWED_METHODS.join(', ')}\r\n` +
-    'Content-Type: text/plain\r\n' +
-    `Content-Length: ${Buffer.byteLength(body)}\r\n` +
-    'Connection: close\r\n' +
-    '\r\n' +
-    body;
   try {
     if (socket.writable && !socket.destroyed) {
-      // end() writes the 405 and sends a FIN, closing the tunnel cleanly.
-      socket.end(response);
+      const body = 'Method Not Allowed';
+      socket.end(
+        'HTTP/1.1 405 Method Not Allowed\r\n' +
+          `Allow: ${ALLOWED_METHODS.join(', ')}\r\n` +
+          'Content-Type: text/plain\r\n' +
+          `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+          'Connection: close\r\n' +
+          '\r\n' +
+          body
+      );
     } else if (!socket.destroyed) {
       socket.destroy();
     }
@@ -694,160 +549,57 @@ function handleConnect(_req, socket) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Coalesced-pipeline response ordering (ACCEPT-F1)
-//
-// When a client coalesces a valid request and following malformed bytes into a
-// single TCP segment, Node parses and dispatches the valid request (whose
-// response this server defers until the body has drained at req 'end') and
-// then SYNCHRONOUSLY emits 'clientError' for the malformed bytes - before the
-// valid request's deferred response has been written. Writing a raw 400 to the
-// socket at that instant (which also half-closes it) discards the still-pending
-// valid response, so the client sees only [400] and never the 200.
-//
-// These two helpers let the 'clientError' handler DEFER its raw status line
-// until every in-flight response on that socket has settled, after which the
-// 400/408 is appended in correct order ([200] then [400]) and the connection is
-// closed - matching both the original server's response preservation and this
-// server's own behavior when the two requests arrive with any time gap. The
-// mechanism is a per-socket counter plus a one-shot 'close' listener; it never
-// touches the valid-request fast path beyond an O(1) map write and a single
-// listener, so the hard performance constraint is preserved.
-// ---------------------------------------------------------------------------
-
 /**
- * Record that a response has been accepted on `socket` and will settle
- * asynchronously, and arrange to decrement that count once the response
- * closes. When the socket's in-flight count returns to zero, any client error
- * that was deferred while responses were pending is flushed in correct order.
+ * Answer a timed-out client with 408 and then release the connection. The 408
+ * is written WITHOUT a FIN so a slow-but-reading client still receives it; the
+ * socket is then reset after a bounded, unref'd linger so a non-reciprocating
+ * peer cannot hold the file descriptor open in FIN_WAIT_2. A client that closes
+ * after reading the 408 is released even sooner.
  *
- * @param {import('net').Socket|undefined|null} socket
- * @param {http.ServerResponse} res
- */
-function trackInFlightResponse(socket, res) {
-  if (!socket) {
-    return;
-  }
-  inFlightResponses.set(socket, (inFlightResponses.get(socket) || 0) + 1);
-
-  // 'close' is emitted exactly once per ServerResponse. For a normally
-  // completed response it fires AFTER 'finish' (i.e. after the response bytes
-  // have been flushed to the socket), so a deferred 400/408 appended here lands
-  // strictly after the completed response; on an aborted response it still
-  // fires, so the count can never be stranded above zero. Decrement, and once
-  // the socket has no more pending responses, emit any deferred client error.
-  res.once('close', () => {
-    const remaining = (inFlightResponses.get(socket) || 1) - 1;
-    if (remaining > 0) {
-      inFlightResponses.set(socket, remaining);
-      return;
-    }
-    inFlightResponses.delete(socket);
-    flushPendingClientError(socket);
-  });
-}
-
-/**
- * Emit a previously deferred client-error status line now that every earlier
- * response on the socket has drained, then close the connection with a FIN. In
- * practice only parser-malformed input (400) is ever deferred: request/headers
- * TIMEOUTS are excluded from the coalesced-pipeline defer (CP3-01) and take the
- * immediate reset-and-release path instead, so they never reach here. The 408
- * branch below is therefore retained only as defensive parity with the deferred
- * error's classification. A no-op when nothing was deferred or the socket is
- * already gone / unwritable.
- *
- * @param {import('net').Socket|undefined|null} socket
- */
-function flushPendingClientError(socket) {
-  if (!socket) {
-    return;
-  }
-  const pending = pendingClientError.get(socket);
-  if (!pending) {
-    return;
-  }
-  pendingClientError.delete(socket);
-  if (socket.destroyed || !socket.writable) {
-    return;
-  }
-  if (pending.code === REQUEST_TIMEOUT_CODE) {
-    socket.end('HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n');
-  } else {
-    socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
-  }
-}
-
-/**
- * Answer a timed-out client with 408 and then deterministically release the
- * socket so a stalled peer cannot hold the file descriptor open (CP3-01).
- *
- * The 408 is WRITTEN (not end()'d): the socket is left writable and no FIN is
- * sent, so the response lands in the client's receive buffer and is delivered to
- * a slow-but-reading client during the grace window (SRV-03 - the response is
- * put on the wire before the connection is torn down, never discarded ahead of
- * delivery). Then, after a bounded, unref'd grace of CLIENT_TIMEOUT_LINGER_MS,
- * the socket is reset with a TCP RST (resetAndDestroy), which releases the
- * descriptor at BOTH ends immediately and leaves NO lingering FIN_WAIT_2 orphan.
- *
- * A graceful end()+destroy() was deliberately NOT used: against a
- * non-reciprocating slowloris peer that never returns its own FIN, the FIN from
- * end() strands the server socket in FIN_WAIT_2 with the process still holding
- * the descriptor until the OS timeout - a bounded but real, exploitable FD hold.
- * The RST avoids that entirely. A well-behaved client that closes its own half
- * after reading the 408 makes the server socket end naturally (the server's
- * sockets are not half-open), firing 'close' and releasing the FD before this
- * timer ever fires - so only non-reciprocating peers actually receive the RST.
- *
- * The grace timer is unref'd so it never keeps the event loop (or a graceful
- * shutdown) alive, is cleared if the socket closes first, and its teardown is
- * guarded so it is a harmless no-op on an already-destroyed socket.
- *
- * @param {import('net').Socket} socket - a writable, non-destroyed client socket
+ * @param {import('net').Socket} socket
  */
 function answerTimeoutAndRelease(socket) {
-  // Write (do NOT end) so the socket stays writable and the 408 is delivered
-  // without committing the connection to a FIN/FIN_WAIT_2 teardown.
-  socket.write('HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n');
-  const release = setTimeout(() => {
-    if (socket.destroyed) {
-      return;
-    }
-    // Prefer an explicit RST (resetAndDestroy, Node >= 16.17 / 18.3) to release
-    // the descriptor at both ends with no FIN_WAIT_2 orphan; fall back to
-    // destroy() on the (theoretical) older runtime where it is unavailable.
-    if (typeof socket.resetAndDestroy === 'function') {
-      socket.resetAndDestroy();
-    } else {
+  try {
+    if (socket.writable && !socket.destroyed) {
+      socket.write('HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n');
+      const linger = setTimeout(() => {
+        if (!socket.destroyed) {
+          socket.destroy();
+        }
+      }, CLIENT_TIMEOUT_LINGER_MS);
+      linger.unref();
+    } else if (!socket.destroyed) {
       socket.destroy();
     }
-  }, CLIENT_TIMEOUT_LINGER_MS);
-  // Never let the grace timer hold the process (or a graceful shutdown) open.
-  release.unref();
-  // If the peer closes on its own first, drop the pending reset.
-  socket.once('close', () => clearTimeout(release));
+  } catch (err) {
+    logConnectionFailureOnce(socket, 'Timeout response failed', err);
+    if (!socket.destroyed) {
+      socket.destroy();
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Server construction and event wiring
+// Server wiring
 // ---------------------------------------------------------------------------
 
 /**
- * Create the HTTP server, configure robust-processing timeouts, and wire the
- * lifecycle/error/connection listeners. Kept as a single named flow so server
- * construction is a clearly delineated concern (SRV-08).
+ * Create the HTTP server around the Express app and attach the connection-level
+ * hardening: robust-processing timeouts, listen-error classification,
+ * client-error (malformed / timeout) handling, CONNECT rejection, and live
+ * socket tracking for deterministic shutdown.
  *
  * @returns {http.Server}
  */
 function createAndConfigureServer() {
   // connectionsCheckingInterval is passed as a construction option (not a
   // post-hoc property) because Node schedules the incomplete-request scan timer
-  // at construction; a smaller interval makes the headersTimeout / requestTimeout
-  // effective close to their configured values instead of only at the default
-  // 30 s scan boundary (SRV-FINAL-05).
+  // at construction; a smaller interval makes the headersTimeout /
+  // requestTimeout effective close to their configured values instead of only
+  // at the default 30 s scan boundary.
   const httpServer = http.createServer(
     { connectionsCheckingInterval: CONNECTIONS_CHECKING_INTERVAL_MS },
-    handleRequest
+    app
   );
 
   // Robust-processing timeouts guard against slow or stalled clients.
@@ -856,21 +608,19 @@ function createAndConfigureServer() {
   httpServer.keepAliveTimeout = KEEPALIVE_TIMEOUT_MS;
 
   // Record that the server is live so the 'error' handler can distinguish a
-  // bind/startup failure from a later runtime failure (SRV-04).
+  // bind/startup failure from a later runtime failure.
   httpServer.on('listening', () => {
     hasListened = true;
   });
 
-  // Server 'error' handling with startup-vs-runtime classification (SRV-04):
+  // Server 'error' handling with startup-vs-runtime classification:
   //  - Before listening (bind failure such as EADDRINUSE / EACCES): no
   //    resources exist to drain, so log and terminate non-zero directly.
-  //  - After listening (runtime/shutdown-time error): preserve a non-zero exit
-  //    code and enter the idempotent cleanup path so in-flight work drains and
-  //    sockets are torn down before the process exits.
+  //  - After listening (runtime error): preserve a non-zero exit code and enter
+  //    the idempotent cleanup path so in-flight work drains and sockets are torn
+  //    down before the process exits.
   httpServer.on('error', (err) => {
     if (!hasListened) {
-      // Sanitized, single-line diagnostic (still carries the [code], e.g.
-      // [EADDRINUSE] / [EACCES]) - no stack unless SERVER_DEBUG=1 (SRV-FINAL-02).
       console.error(`Server startup error: ${describeError(err)}`);
       process.exit(1);
       return;
@@ -878,31 +628,13 @@ function createAndConfigureServer() {
     handleFatalError('serverError', err);
   });
 
-  // Malformed-request / client-error handling (SRV-09):
+  // Malformed-request / client-error handling:
   //  - A request/header timeout is a timeout, not malformed syntax: answer 408.
   //  - Parser-malformed input (HPE_* etc.) gets 400.
   //  - Already-reset (ECONNRESET) or unwritable sockets get no write (it would
-  //    just error again); routine resets are not logged (SRV-10 / SRV-11).
+  //    just error again); routine resets are not logged.
   httpServer.on('clientError', (err, socket) => {
     const canWrite = Boolean(socket) && socket.writable && !socket.destroyed;
-
-    // Response-desync guard (SRV-12): if a complete response has already been
-    // emitted for the request currently bound to this socket (e.g. a 413 for an
-    // oversized body that the client then aborted, which surfaces here as
-    // HPE_INVALID_EOF_STATE), synthesizing another response would put two HTTP
-    // responses on one connection - a framing violation a proxy could treat as
-    // a response-splitting / request-smuggling primitive. Do NOT write a second
-    // response; instead end our side gracefully with a FIN, which flushes the
-    // already-written response rather than discarding it with an RST (the 413
-    // path deliberately kept the socket writable for exactly this reason,
-    // SRV-03). The connection is then done.
-    if (socket && respondedForRequest.has(socket)) {
-      respondedForRequest.delete(socket);
-      if (canWrite) {
-        socket.end();
-      }
-      return;
-    }
 
     if (err.code === 'ECONNRESET' || !canWrite) {
       if (err.code !== 'ECONNRESET') {
@@ -911,52 +643,8 @@ function createAndConfigureServer() {
       return;
     }
 
-    // Coalesced-pipeline ordering guard (ACCEPT-F1) - PARSER-MALFORMED ERRORS
-    // ONLY. If a response for an earlier, already-accepted request on this
-    // socket is still in flight (the classic case is a single TCP segment
-    // carrying "GET / <valid>" immediately followed by "<malformed>": Node
-    // dispatches the valid request - whose response is deferred until its body
-    // drains at req 'end' - and then synchronously lands here for the malformed
-    // bytes), writing the raw status line NOW would be injected ahead of, or
-    // would half-close the socket and discard, that pending response,
-    // suppressing it entirely. Reaching this point means the socket is still
-    // writable and the error is not a bare reset, so instead of racing the
-    // pending response we DEFER the status line; flushPendingClientError()
-    // emits it in correct order ([200] then [400]) and closes the connection
-    // once the socket's in-flight responses have drained. A standalone
-    // malformed request never dispatched a 'request' event (its headers never
-    // parsed), so its in-flight count is zero and it still takes the immediate
-    // paths below unchanged.
-    //
-    // A request/headers TIMEOUT is deliberately EXCLUDED from this defer
-    // (CP3-01): a timeout means the peer has stalled and the connection is
-    // effectively dead, so an in-flight response for that stalled request can
-    // NEVER settle (its body will not arrive) - which means the deferred flush,
-    // which only runs once in-flight responses drain to zero, would never fire
-    // and the socket/FD would leak indefinitely (an exploitable slowloris-
-    // variant, and a regression versus stock Node's send-408-and-close). The
-    // ordering rationale above exists to preserve a still-deliverable response
-    // on a LIVE connection; it does not apply to a dead one. Timeouts therefore
-    // skip the defer and fall through to the immediate 408-and-close path
-    // below, releasing the connection promptly regardless of in-flight state.
-    if (err.code !== REQUEST_TIMEOUT_CODE && (inFlightResponses.get(socket) || 0) > 0) {
-      if (!pendingClientError.has(socket)) {
-        pendingClientError.set(socket, { code: err.code });
-        // Log once now (deduplicated per socket); the deferred flush only writes
-        // bytes, mirroring the immediate paths' "log then respond". Only parser-
-        // malformed errors reach here (timeouts are excluded above), so the
-        // context is always the generic client-error label.
-        logConnectionFailureOnce(socket, 'Client error', err);
-      }
-      return;
-    }
-
     if (err.code === REQUEST_TIMEOUT_CODE) {
       logConnectionFailureOnce(socket, 'Client request timeout', err);
-      // Write the 408 (delivered during a bounded grace, SRV-03) and then reset
-      // the connection so a non-reciprocating stalled peer cannot hold the
-      // descriptor open in FIN_WAIT_2 - releasing the FD deterministically at
-      // both ends (CP3-01).
       answerTimeoutAndRelease(socket);
       return;
     }
@@ -966,9 +654,7 @@ function createAndConfigureServer() {
   });
 
   // CONNECT tunnel requests arrive on the special 'connect' event and bypass
-  // handleRequest; answer them with the ordinary 405 + Allow contract and close
-  // the socket, so every unsupported method - CONNECT included - is rejected
-  // consistently (SRV-FINAL-01).
+  // the Express app; answer them with the ordinary 405 + Allow contract.
   httpServer.on('connect', handleConnect);
 
   // Connection tracking (resource cleanup): remember every live socket and
@@ -985,13 +671,9 @@ function createAndConfigureServer() {
 }
 
 // Runtime singletons. These are assigned by main() only when the file is run
-// directly (`node server.js`). They are declared at module scope - not as
-// top-level `const` initializers - so the lifecycle functions (startServer /
-// shutdown / handleFatalError) can reference them, while they remain unset when
-// the module is merely `require`d (e.g. by the test suite). Guarding all
-// side-effectful startup behind main()/require.main means importing server.js
-// performs NO config read, creates NO server, opens NO port, and registers NO
-// process/signal handlers - so an importer's process is never mutated.
+// directly (`node server.js`). They are declared at module scope so the
+// lifecycle functions can reference them, while they remain unset when the
+// module is merely `require`d (e.g. by the test suite).
 let hostname;
 let port;
 let server;
@@ -1002,8 +684,8 @@ let server;
 
 /**
  * Record a requested process exit code, only ever escalating upward. A
- * previously recorded failure (non-zero) is never downgraded back to success
- * by a later normal code path (SRV-05).
+ * previously recorded failure (non-zero) is never downgraded back to success by
+ * a later normal code path.
  *
  * @param {number} code
  */
@@ -1030,8 +712,7 @@ function finalizeExit() {
  * Handle a fatal error (uncaught exception, unhandled rejection, or a runtime
  * server error): log it sanitized, record a non-zero exit code that survives
  * the shutdown drain, and enter the idempotent shutdown so cleanup runs before
- * the process exits non-zero (SRV-05). This is the last-resort safety net -
- * it is non-recursive because shutdown() is guarded.
+ * the process exits non-zero. Non-recursive because shutdown() is guarded.
  *
  * @param {string} context
  * @param {unknown} err
@@ -1048,11 +729,9 @@ function handleFatalError(context, err) {
 
 /**
  * Format a `host:port` authority for a startup URL, bracketing IPv6 literals so
- * the emitted URL is valid and copyable. An IPv6 literal contains ':' and per
- * RFC 3986 / RFC 9110 MUST be wrapped in square brackets inside a URL authority
- * (`http://[::1]:3000/`); IPv4 addresses and hostnames contain no ':' and are
- * used verbatim, so the default line remains exactly `127.0.0.1:3000`
- * (SRV-FINAL-04).
+ * the emitted URL is valid and copyable (`http://[::1]:3000/`). IPv4 addresses
+ * and hostnames contain no ':' and are used verbatim, so the default line
+ * remains exactly `127.0.0.1:3000`.
  *
  * @param {string} host
  * @param {number} portNumber
@@ -1064,11 +743,10 @@ function formatAuthority(host, portNumber) {
 }
 
 /**
- * Start listening. The startup log line is preserved verbatim from the
- * original server; the real bound port (from server.address()) is used so the
- * default case logs exactly `http://127.0.0.1:3000/` while an ephemeral
- * PORT=0 reports the actual assigned port. IPv6 hosts are bracketed via
- * formatAuthority so the logged URL is always valid (SRV-FINAL-04).
+ * Start listening. The startup log line is preserved verbatim from the original
+ * server; the real bound port (from server.address()) is used so the default
+ * case logs exactly `http://127.0.0.1:3000/` while an ephemeral PORT=0 reports
+ * the actual assigned port.
  */
 function startServer() {
   server.listen(port, hostname, () => {
@@ -1082,9 +760,8 @@ function startServer() {
  * Graceful shutdown: stop accepting new connections, drain in-flight requests,
  * and exit with the recorded code when drained. A bounded, unref'd force timer
  * is armed BEFORE any cleanup that could throw, so a synchronous failure can
- * never strand the process (SRV-06). Idempotent - repeated signals are ignored
- * after the first (SRV-06 re-entrancy guard). Normal signals exit 0; a recorded
- * fatal/runtime failure exits non-zero (SRV-05).
+ * never strand the process. Idempotent - repeated signals are ignored after the
+ * first. Normal signals exit 0; a recorded fatal/runtime failure exits non-zero.
  *
  * @param {string} signal - The signal or reason that triggered the shutdown.
  */
@@ -1098,9 +775,8 @@ function shutdown(signal) {
 
   // Arm the bounded, unref'd force/finalization fallback FIRST - before any
   // cleanup below that could throw - so nothing can leave the process running
-  // without a scheduled exit. If connections do not drain in time, remaining
-  // sockets are torn down and the process exits non-zero. unref() ensures the
-  // timer never keeps the event loop (and therefore the process) alive.
+  // without a scheduled exit. unref() ensures the timer never keeps the event
+  // loop (and therefore the process) alive.
   const forceTimer = setTimeout(() => {
     console.error('Forced shutdown: connections did not drain in time.');
     requestExit(1);
@@ -1144,7 +820,7 @@ function shutdown(signal) {
     }
   } catch (cleanupErr) {
     // Cleanup setup itself threw: escalate to a deterministic non-zero exit
-    // rather than leaving the process half-shut-down and still serving (SRV-06).
+    // rather than leaving the process half-shut-down and still serving.
     console.error(`Error initiating shutdown: ${describeError(cleanupErr)}`);
     requestExit(1);
     clearTimeout(forceTimer);
@@ -1168,7 +844,7 @@ function registerProcessHandlers() {
 
   // Last-resort safety nets: record a non-zero exit code, log the fault
   // sanitized, and shut down gracefully rather than leaving the process in an
-  // undefined state or exiting successfully after a fatal error (SRV-05 / SRV-10).
+  // undefined state or exiting successfully after a fatal error.
   process.on('uncaughtException', (err) => handleFatalError('uncaughtException', err));
   process.on('unhandledRejection', (reason) => handleFatalError('unhandledRejection', reason));
 }
@@ -1194,28 +870,28 @@ function main() {
 
 // Auto-start ONLY when executed directly (`node server.js`), preserving the
 // original run behavior exactly. When this file is instead `require`d as a
-// module (e.g. by server.test.js for deterministic in-process unit tests of the
-// pure handlers/helpers) nothing runs: no config load, no server, no listen, no
-// process handlers - so the importing process is never mutated.
+// module (e.g. by server.test.js) nothing runs: no config load, no server, no
+// listen, no process handlers - so the importing process is never mutated.
 if (require.main === module) {
   main();
 }
 
 // Testability surface (see the require.main guard above). Exporting these does
 // NOT change the runtime: running the file directly still auto-starts, and an
-// importer must call main()/startServer() explicitly. The set is kept small and
-// deliberate - the pure/near-pure units needed to verify the request contract,
-// CONNECT rejection, request error boundary, safe logging, and address
-// formatting without spawning a process.
+// importer must call main()/startServer()/createAndConfigureServer() explicitly.
 module.exports = {
-  handleRequest,
-  handleConnect,
-  routeRequest,
-  loadConfiguration,
+  app,
+  createApp,
   createAndConfigureServer,
+  handleConnect,
+  errorHandler,
+  loadConfiguration,
   describeError,
   sanitizeLogValue,
   formatAuthority,
   ALLOWED_METHODS,
   MAX_BODY_SIZE,
+  HELLO_BODY,
+  GOOD_MORNING_BODY,
+  GOOD_MORNING_PATH,
 };

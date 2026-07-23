@@ -1,10 +1,15 @@
 'use strict';
 
 /**
- * server.test.js - Node core tests for the hardened HTTP server.
+ * server.test.js - Tests for the Express-based HTTP server.
  *
- * Two complementary layers, both zero-dependency (Node.js built-ins only, per
- * AAP 0.6 / 0.8.1):
+ * The server exposes two plaintext endpoints - GET / ("Hello, World!\n") and
+ * GET /good-morning ("Good morning\n") - built with Express on top of a
+ * hardened Node core http.Server. Express is the project's only third-party
+ * dependency; the tests drive the server as a real HTTP client and exercise its
+ * exported units directly.
+ *
+ * Two complementary layers:
  *
  *   1. BLACK-BOX process tests - spawn the real entry point (`node server.js`)
  *      on an OS-assigned ephemeral port (PORT=0) and drive it over real HTTP
@@ -510,6 +515,8 @@ describe('HTTP contract and framing (spawned server)', () => {
     assert.ok(result.code !== undefined, 'child exit must be observed');
   });
 
+  // --- Preserved default endpoint: GET / ---
+
   it('GET / -> 200 text/plain, exact "Hello, World!\\n"', { timeout: TEST_TIMEOUT_MS }, async () => {
     markStderr();
     const res = await httpRequest({ port, method: 'GET', path: '/' });
@@ -517,7 +524,21 @@ describe('HTTP contract and framing (spawned server)', () => {
     // Exact media type (normalized), not a permissive substring match.
     assert.strictEqual((res.headers['content-type'] || '').split(';')[0].trim(), 'text/plain');
     assert.strictEqual(res.body, 'Hello, World!\n');
+    // Express's framework banner must be suppressed.
+    assert.ok(!res.headers['x-powered-by'], 'X-Powered-By must be disabled');
     await assertNoNewStderr('GET /');
+  });
+
+  // --- Added endpoint: GET /good-morning ---
+
+  it('GET /good-morning -> 200 text/plain, exact "Good morning\\n"', { timeout: TEST_TIMEOUT_MS }, async () => {
+    markStderr();
+    const res = await httpRequest({ port, method: 'GET', path: '/good-morning' });
+    assert.strictEqual(res.statusCode, 200);
+    assert.strictEqual((res.headers['content-type'] || '').split(';')[0].trim(), 'text/plain');
+    assert.strictEqual(res.body, 'Good morning\n');
+    assert.ok(!res.headers['x-powered-by'], 'X-Powered-By must be disabled');
+    await assertNoNewStderr('GET /good-morning');
   });
 
   it('HEAD / -> 200 text/plain, empty body', { timeout: TEST_TIMEOUT_MS }, async () => {
@@ -529,6 +550,15 @@ describe('HTTP contract and framing (spawned server)', () => {
     await assertNoNewStderr('HEAD /');
   });
 
+  it('HEAD /good-morning -> 200 text/plain, empty body', { timeout: TEST_TIMEOUT_MS }, async () => {
+    markStderr();
+    const res = await httpRequest({ port, method: 'HEAD', path: '/good-morning' });
+    assert.strictEqual(res.statusCode, 200);
+    assert.strictEqual((res.headers['content-type'] || '').split(';')[0].trim(), 'text/plain');
+    assert.strictEqual(res.body, '', 'HEAD response must have no body (RFC 9110)');
+    await assertNoNewStderr('HEAD /good-morning');
+  });
+
   it('GET /?x=1 -> 200 (query on root is still the root route)', { timeout: TEST_TIMEOUT_MS }, async () => {
     markStderr();
     const res = await httpRequest({ port, method: 'GET', path: '/?x=1' });
@@ -537,11 +567,27 @@ describe('HTTP contract and framing (spawned server)', () => {
     await assertNoNewStderr('GET /?x=1');
   });
 
-  it('GET /does-not-exist -> 404', { timeout: TEST_TIMEOUT_MS }, async () => {
+  it('GET /good-morning?tz=utc -> 200 (query preserved on the added route)', { timeout: TEST_TIMEOUT_MS }, async () => {
+    markStderr();
+    const res = await httpRequest({ port, method: 'GET', path: '/good-morning?tz=utc' });
+    assert.strictEqual(res.statusCode, 200);
+    assert.strictEqual(res.body, 'Good morning\n');
+    await assertNoNewStderr('GET /good-morning?tz=utc');
+  });
+
+  it('GET /does-not-exist -> 404 "Not Found"', { timeout: TEST_TIMEOUT_MS }, async () => {
     markStderr();
     const res = await httpRequest({ port, method: 'GET', path: '/does-not-exist' });
     assert.strictEqual(res.statusCode, 404);
+    assert.strictEqual(res.body, 'Not Found');
     await assertNoNewStderr('GET /does-not-exist');
+  });
+
+  it('GET /good-morning/extra -> 404 (added route matches its exact path only)', { timeout: TEST_TIMEOUT_MS }, async () => {
+    markStderr();
+    const res = await httpRequest({ port, method: 'GET', path: '/good-morning/extra' });
+    assert.strictEqual(res.statusCode, 404);
+    await assertNoNewStderr('GET /good-morning/extra');
   });
 
   it('DELETE / -> 405 with exact Allow: GET, HEAD', { timeout: TEST_TIMEOUT_MS }, async () => {
@@ -549,6 +595,7 @@ describe('HTTP contract and framing (spawned server)', () => {
     const res = await httpRequest({ port, method: 'DELETE', path: '/' });
     assert.strictEqual(res.statusCode, 405);
     assert.strictEqual(res.headers['allow'], 'GET, HEAD', 'Allow header must be exact');
+    assert.strictEqual(res.body, 'Method Not Allowed');
     await assertNoNewStderr('DELETE /');
   });
 
@@ -558,6 +605,14 @@ describe('HTTP contract and framing (spawned server)', () => {
     assert.strictEqual(res.statusCode, 405);
     assert.strictEqual(res.headers['allow'], 'GET, HEAD');
     await assertNoNewStderr('POST /anything');
+  });
+
+  it('POST /good-morning -> 405 (method before path, even on a known route)', { timeout: TEST_TIMEOUT_MS }, async () => {
+    markStderr();
+    const res = await httpRequest({ port, method: 'POST', path: '/good-morning' });
+    assert.strictEqual(res.statusCode, 405);
+    assert.strictEqual(res.headers['allow'], 'GET, HEAD');
+    await assertNoNewStderr('POST /good-morning');
   });
 
   it('body cap boundary: exactly 1 MiB is accepted (routes -> 405 for POST)', { timeout: TEST_TIMEOUT_MS }, async () => {
@@ -573,6 +628,7 @@ describe('HTTP contract and framing (spawned server)', () => {
     markStderr();
     const res = await httpRequest({ port, method: 'POST', path: '/', body: Buffer.alloc(MAX_BODY_SIZE + 1, 0x61) });
     assert.strictEqual(res.statusCode, 413, 'one byte over the cap must be 413');
+    assert.strictEqual(res.body, 'Payload Too Large');
     await assertNewStderrSafe('boundary 1 MiB + 1');
   });
 
@@ -591,20 +647,20 @@ describe('HTTP contract and framing (spawned server)', () => {
     );
     assert.strictEqual(responseCount, 1, `expected exactly one HTTP response, got ${responseCount}:\n${raw}`);
     assert.match(statusLine(raw), /^HTTP\/1\.1 200 OK$/);
-    // Framing-agnostic body assertion. The hardened handler commits headers via
-    // res.writeHead(...) before the body length is known, so Node frames the
-    // greeting with Transfer-Encoding: chunked (the greeting arrives as a single
-    // chunk: "e\r\nHello, World!\n\r\n0\r\n\r\n") rather than Content-Length.
-    // Both framings are valid HTTP/1.1 and decode to the identical body, which
-    // the semantic GET / test already asserts exactly (res.body === greeting).
-    // This raw check therefore verifies wire integrity - Content-Type is present
-    // on the wire, and the greeting is delivered exactly once - without asserting
-    // the (incidental) framing mechanism, so it stays correct under either.
+    // Framing-agnostic body assertion. Express commits a Content-Length for the
+    // fixed-size greeting (the semantic GET / test already asserts the exact
+    // body), so this raw check only verifies wire integrity: the Content-Type is
+    // present (it carries a "; charset=utf-8" parameter, which is tolerated) and
+    // the greeting is delivered exactly once.
     const headerEnd = raw.indexOf('\r\n\r\n');
     assert.ok(headerEnd !== -1, `response must have a header/body separator:\n${raw}`);
     const headerBlock = raw.slice(0, headerEnd);
     const bodyRegion = raw.slice(headerEnd + 4);
-    assert.match(headerBlock, /\r\nContent-Type: text\/plain\r\n/, 'Content-Type: text/plain must be on the wire');
+    assert.match(
+      headerBlock,
+      /\r\nContent-Type: text\/plain(?:;[^\r\n]*)?\r\n/,
+      'Content-Type: text/plain must be on the wire'
+    );
     assert.strictEqual(
       bodyRegion.split('Hello, World!\n').length - 1,
       1,
@@ -613,7 +669,47 @@ describe('HTTP contract and framing (spawned server)', () => {
     await assertNoNewStderr('raw GET /');
   });
 
-  it('raw CONNECT -> exactly one 405 + Allow, then close (SRV-FINAL-01)', { timeout: TEST_TIMEOUT_MS }, async () => {
+  it('raw GET /good-morning -> exactly one 200 response with the greeting once', { timeout: TEST_TIMEOUT_MS }, async () => {
+    markStderr();
+    const { raw, responseCount } = await rawExchange(
+      port,
+      'GET /good-morning HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n'
+    );
+    assert.strictEqual(responseCount, 1, `expected exactly one HTTP response, got ${responseCount}:\n${raw}`);
+    assert.match(statusLine(raw), /^HTTP\/1\.1 200 OK$/);
+    const headerEnd = raw.indexOf('\r\n\r\n');
+    assert.ok(headerEnd !== -1, `response must have a header/body separator:\n${raw}`);
+    const bodyRegion = raw.slice(headerEnd + 4);
+    assert.strictEqual(
+      bodyRegion.split('Good morning\n').length - 1,
+      1,
+      `the good-morning body must appear exactly once:\n${raw}`
+    );
+    await assertNoNewStderr('raw GET /good-morning');
+  });
+
+  it('two valid pipelined requests on one connection -> two 200s in order', { timeout: TEST_TIMEOUT_MS }, async () => {
+    markStderr();
+    // A single write carrying two COMPLETE valid requests (the second closes the
+    // connection). Both must be answered, in order, over the one keep-alive
+    // socket - a basic HTTP/1.1 pipelining correctness check.
+    const { raw, responseCount } = await rawExchange(
+      port,
+      'GET / HTTP/1.1\r\nHost: test\r\n\r\nGET /good-morning HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n'
+    );
+    assert.strictEqual(responseCount, 2, `expected exactly two responses, got ${responseCount}:\n${raw}`);
+    assert.match(statusLine(raw), /^HTTP\/1\.1 200 OK$/, `first response must be 200:\n${raw}`);
+    const helloIdx = raw.indexOf('Hello, World!\n');
+    const gmIdx = raw.indexOf('Good morning\n');
+    assert.ok(helloIdx !== -1, `the first greeting must be delivered:\n${raw}`);
+    assert.ok(gmIdx !== -1, `the second greeting must be delivered:\n${raw}`);
+    assert.ok(helloIdx < gmIdx, `responses must be in request order:\n${raw}`);
+    assert.strictEqual(raw.split('Hello, World!\n').length - 1, 1, 'first greeting exactly once');
+    assert.strictEqual(raw.split('Good morning\n').length - 1, 1, 'second greeting exactly once');
+    await assertNoNewStderr('two pipelined valid requests');
+  });
+
+  it('raw CONNECT -> exactly one 405 + Allow, then close', { timeout: TEST_TIMEOUT_MS }, async () => {
     markStderr();
     const { raw, responseCount } = await rawExchange(
       port,
@@ -637,135 +733,10 @@ describe('HTTP contract and framing (spawned server)', () => {
     // A client error IS logged, but must be a single sanitized line (no stack).
     await assertNewStderrSafe('raw malformed', /Client error:/);
   });
-
-  // -------------------------------------------------------------------------
-  // Coalesced valid-then-malformed pipeline ordering (ACCEPT-F1)
-  //
-  // A single TCP write carrying a COMPLETE valid request immediately followed
-  // by malformed bytes must NOT let the parser error on the later bytes
-  // suppress the earlier, already-accepted request's response. Node dispatches
-  // the valid request (whose response this server defers until its body drains
-  // at req 'end') and then synchronously emits 'clientError' for the malformed
-  // bytes; the server must preserve/flush the earlier response FIRST and only
-  // then answer the malformed request (400) or close - never write a bare 400
-  // that discards the pending valid response. Regression guard: against the
-  // pre-fix server every one of these returns only [400] with no greeting.
-  // rawExchange writes the whole payload in a single socket.write(), so these
-  // exercise the coalesced same-segment path directly.
-  // -------------------------------------------------------------------------
-
-  it('ACCEPT-F1: coalesced valid GET + malformed preserves the 200 (then 400)', { timeout: TEST_TIMEOUT_MS }, async () => {
-    markStderr();
-    const { raw, responseCount } = await rawExchange(
-      port,
-      'GET / HTTP/1.1\r\nHost: test\r\n\r\nGET / HTTP/1.1\r\nBad Header\r\n\r\n'
-    );
-    assert.match(
-      statusLine(raw),
-      /^HTTP\/1\.1 200 OK$/,
-      `first response must be the earlier valid 200, not the later 400:\n${raw}`
-    );
-    const greetingIdx = raw.indexOf('Hello, World!\n');
-    assert.ok(greetingIdx !== -1, `the valid request's greeting must be preserved:\n${raw}`);
-    assert.strictEqual(
-      raw.split('Hello, World!\n').length - 1,
-      1,
-      `the greeting must appear exactly once:\n${raw}`
-    );
-    const badIdx = raw.indexOf('400 Bad Request');
-    assert.ok(badIdx !== -1, `the later malformed request should still be answered with 400:\n${raw}`);
-    assert.ok(greetingIdx < badIdx, `the 200 greeting must be delivered before the 400:\n${raw}`);
-    assert.strictEqual(responseCount, 2, `expected exactly [200, 400], got ${responseCount} responses:\n${raw}`);
-    // The malformed tail IS a client error: logged once, single sanitized line.
-    await assertNewStderrSafe('coalesced valid+malformed', /Client error:/);
-  });
-
-  it('ACCEPT-F1: coalesced HEAD + malformed preserves the HEAD 200 (then 400)', { timeout: TEST_TIMEOUT_MS }, async () => {
-    markStderr();
-    const { raw, responseCount } = await rawExchange(
-      port,
-      'HEAD / HTTP/1.1\r\nHost: test\r\n\r\nGET / HTTP/1.1\r\nBad Header\r\n\r\n'
-    );
-    assert.match(
-      statusLine(raw),
-      /^HTTP\/1\.1 200 OK$/,
-      `first response must be the earlier valid HEAD 200:\n${raw}`
-    );
-    // HEAD must carry no message body (RFC 9110): the greeting never appears.
-    assert.strictEqual(raw.indexOf('Hello, World!'), -1, `HEAD must not include a body:\n${raw}`);
-    assert.ok(raw.indexOf('400 Bad Request') !== -1, `the later malformed request should be answered with 400:\n${raw}`);
-    assert.strictEqual(responseCount, 2, `expected exactly [200, 400], got ${responseCount}:\n${raw}`);
-    await assertNewStderrSafe('coalesced HEAD+malformed', /Client error:/);
-  });
-
-  it('ACCEPT-F1: coalesced unknown-path (404) + malformed preserves the 404 (then 400)', { timeout: TEST_TIMEOUT_MS }, async () => {
-    markStderr();
-    const { raw, responseCount } = await rawExchange(
-      port,
-      'GET /does-not-exist HTTP/1.1\r\nHost: test\r\n\r\nGET / HTTP/1.1\r\nBad Header\r\n\r\n'
-    );
-    assert.match(
-      statusLine(raw),
-      /^HTTP\/1\.1 404 Not Found$/,
-      `first response must be the earlier valid 404, not the later 400:\n${raw}`
-    );
-    assert.ok(raw.indexOf('400 Bad Request') !== -1, `the later malformed request should be answered with 400:\n${raw}`);
-    assert.strictEqual(responseCount, 2, `expected exactly [404, 400], got ${responseCount}:\n${raw}`);
-    await assertNewStderrSafe('coalesced 404+malformed', /Client error:/);
-  });
-
-  it('ACCEPT-F1: coalesced unsupported-method (405) + malformed preserves the 405 (then 400)', { timeout: TEST_TIMEOUT_MS }, async () => {
-    markStderr();
-    const { raw, responseCount } = await rawExchange(
-      port,
-      'POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nBad Header\r\n\r\n'
-    );
-    assert.match(
-      statusLine(raw),
-      /^HTTP\/1\.1 405 Method Not Allowed$/,
-      `first response must be the earlier valid 405, not the later 400:\n${raw}`
-    );
-    assert.match(raw, /\r\nAllow: GET, HEAD\r\n/, `the 405 must carry Allow: GET, HEAD:\n${raw}`);
-    assert.ok(raw.indexOf('400 Bad Request') !== -1, `the later malformed request should be answered with 400:\n${raw}`);
-    assert.strictEqual(responseCount, 2, `expected exactly [405, 400], got ${responseCount}:\n${raw}`);
-    await assertNewStderrSafe('coalesced 405+malformed', /Client error:/);
-  });
-
-  it('ACCEPT-F1: coalesced two valid GETs + malformed preserves both 200s (then 400)', { timeout: TEST_TIMEOUT_MS }, async () => {
-    markStderr();
-    const { raw, responseCount } = await rawExchange(
-      port,
-      'GET / HTTP/1.1\r\nHost: test\r\n\r\nGET / HTTP/1.1\r\nHost: test\r\n\r\nGET / HTTP/1.1\r\nBad Header\r\n\r\n'
-    );
-    assert.match(statusLine(raw), /^HTTP\/1\.1 200 OK$/, `first response must be a valid 200:\n${raw}`);
-    assert.strictEqual(
-      raw.split('Hello, World!\n').length - 1,
-      2,
-      `both valid greetings must be preserved (exactly twice):\n${raw}`
-    );
-    assert.ok(raw.indexOf('400 Bad Request') !== -1, `the later malformed request should be answered with 400:\n${raw}`);
-    assert.strictEqual(responseCount, 3, `expected exactly [200, 200, 400], got ${responseCount}:\n${raw}`);
-    await assertNewStderrSafe('coalesced two-valid+malformed', /Client error:/);
-  });
-
-  it('ACCEPT-F1: coalesced Connection: close valid GET + malformed still preserves the 200', { timeout: TEST_TIMEOUT_MS }, async () => {
-    markStderr();
-    const { raw } = await rawExchange(
-      port,
-      'GET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\nGET / HTTP/1.1\r\nBad Header\r\n\r\n'
-    );
-    // With Connection: close the server closes after the 200, so the malformed
-    // tail causes closure rather than a written 400 - either is acceptable per
-    // the contract, but the earlier valid 200 must ALWAYS be preserved first.
-    assert.match(statusLine(raw), /^HTTP\/1\.1 200 OK$/, `the valid 200 must be preserved first:\n${raw}`);
-    assert.ok(raw.indexOf('Hello, World!\n') !== -1, `the greeting must be delivered:\n${raw}`);
-    // The malformed tail is still a logged, single-line, stack-free client error.
-    await assertNewStderrSafe('coalesced close+malformed', /Client error:/);
-  });
 });
 
 // ===========================================================================
-// Timeout enforcement (dedicated child; SRV-FINAL-05)
+// Timeout enforcement (dedicated child)
 // ===========================================================================
 
 describe('timeout enforcement (spawned server)', () => {
@@ -798,28 +769,21 @@ describe('timeout enforcement (spawned server)', () => {
 });
 
 // ===========================================================================
-// Timeout enforcement - dispatched slow body (CP3-01 regression, in-process)
+// Timeout enforcement - dispatched slow body (in-process)
 // ===========================================================================
 //
-// A request whose HEADERS complete (so Node dispatches a 'request' event and an
-// in-flight response is registered) but whose BODY then stalls past
-// requestTimeout must still be answered with a 408 AND have its socket released.
-// The original defect deferred that timeout behind the in-flight response - which
-// could never settle for a stalled connection - so the 408 was never sent and
-// the socket/FD leaked indefinitely (a slowloris-style resource-exhaustion
-// vector). The fix routes timeouts past the coalesced-pipeline defer to the
-// immediate answer-and-release path.
+// A request whose HEADERS complete (so Node dispatches the request to Express
+// and body streaming begins) but whose BODY then stalls past requestTimeout
+// must still be answered with a 408 AND have its socket released, rather than
+// leaking the connection/FD (a slowloris-style resource-exhaustion vector).
 //
-// This test runs IN-PROCESS via the exported createAndConfigureServer with a
-// shortened requestTimeout so it exercises the real handler + 'clientError'
-// wiring quickly (the headers-phase test above already covers the spawned real
-// process). It uses a NON-RECIPROCATING client (allowHalfOpen: true) that
-// ignores the server's FIN and never closes its own half - the adversarial case
-// that, with a bare socket.end(), would strand the server socket in FIN_WAIT_2
-// with the descriptor still held. It therefore asserts BOTH that the 408 is
-// delivered (FIN-first, so a slow-but-reading client still receives it) AND that
-// the server ultimately destroys (releases) the socket, guarding the full fix.
-describe('timeout enforcement - dispatched slow body (CP3-01, in-process)', () => {
+// This runs IN-PROCESS via the exported createAndConfigureServer with a
+// shortened requestTimeout so it drives the real 'clientError' timeout wiring
+// quickly. It uses a NON-RECIPROCATING client (allowHalfOpen: true) that
+// ignores the server's FIN, so it asserts BOTH that the 408 is delivered
+// (FIN-first, so a slow-but-reading client still receives it) AND that the
+// server ultimately destroys (releases) the socket.
+describe('timeout enforcement - dispatched slow body (in-process)', () => {
   it(
     'a dispatched request whose body stalls past requestTimeout is answered 408 and the socket is released (not leaked)',
     { timeout: TEST_TIMEOUT_MS },
@@ -827,9 +791,9 @@ describe('timeout enforcement - dispatched slow body (CP3-01, in-process)', () =
       const srv = require('./server.js');
       const server = srv.createAndConfigureServer();
       // Shorten the request timeout so the incomplete-request scan fires quickly
-      // while still driving the genuine handler + clientError path. The linger
-      // before force-destroy is a fixed internal, so the socket is released at
-      // roughly requestTimeout + linger.
+      // while still driving the genuine 'clientError' path. The linger before
+      // force-destroy is a fixed internal, so the socket is released at roughly
+      // requestTimeout + linger.
       server.requestTimeout = 1500;
       server.headersTimeout = 1000;
 
@@ -861,8 +825,8 @@ describe('timeout enforcement - dispatched slow body (CP3-01, in-process)', () =
           const client = net.connect(
             { port, host: TEST_HOST, allowHalfOpen: true },
             () => {
-              // Complete the headers (dispatches the request -> in-flight
-              // response), then send only part of the promised body and stall.
+              // Complete the headers (dispatches the request -> body streaming),
+              // then send only part of the promised body and stall.
               client.write('POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n');
               client.write('0123456789');
             }
@@ -947,7 +911,7 @@ describe('configuration and startup (spawned children)', () => {
     });
   });
 
-  it('IPv6 HOST=::1 -> bracketed startup URL (SRV-FINAL-04)', { timeout: TEST_TIMEOUT_MS }, async (t) => {
+  it('IPv6 HOST=::1 -> bracketed startup URL', { timeout: TEST_TIMEOUT_MS }, async (t) => {
     if (!(await ipv6LoopbackAvailable())) {
       t.skip('IPv6 loopback (::1) not available on this host');
       return;
@@ -997,26 +961,70 @@ describe('graceful shutdown (POSIX signals)', () => {
 });
 
 // ===========================================================================
-// In-process unit tests of exported units (deterministic; no spawning)
+// In-process unit + integration tests of exported units (no spawning)
 // ===========================================================================
 
-describe('unit: exported handlers and helpers', () => {
+describe('unit: exported units and helpers', () => {
   // Importing is side-effect-free thanks to the require.main guard in server.js.
   const srv = require('./server.js');
 
   it('exports the documented testability surface', () => {
     for (const name of [
-      'handleRequest', 'handleConnect', 'routeRequest', 'loadConfiguration',
-      'createAndConfigureServer', 'describeError', 'sanitizeLogValue', 'formatAuthority',
-      'ALLOWED_METHODS', 'MAX_BODY_SIZE',
+      'app', 'createApp', 'createAndConfigureServer', 'handleConnect', 'errorHandler',
+      'loadConfiguration', 'describeError', 'sanitizeLogValue', 'formatAuthority',
+      'ALLOWED_METHODS', 'MAX_BODY_SIZE', 'HELLO_BODY', 'GOOD_MORNING_BODY', 'GOOD_MORNING_PATH',
     ]) {
       assert.strictEqual(typeof srv[name] !== 'undefined', true, `missing export: ${name}`);
     }
     assert.deepStrictEqual(srv.ALLOWED_METHODS, ['GET', 'HEAD']);
     assert.strictEqual(srv.MAX_BODY_SIZE, MAX_BODY_SIZE);
+    assert.strictEqual(srv.HELLO_BODY, 'Hello, World!\n');
+    assert.strictEqual(srv.GOOD_MORNING_BODY, 'Good morning\n');
+    assert.strictEqual(srv.GOOD_MORNING_PATH, '/good-morning');
+    assert.strictEqual(typeof srv.app, 'function', 'app must be an Express request handler');
+    assert.strictEqual(typeof srv.createApp, 'function');
   });
 
-  it('describeError: single-line, sanitized, no stack by default (SRV-FINAL-02)', () => {
+  it('createApp: builds a fresh, independent Express application each call', () => {
+    const a = srv.createApp();
+    const b = srv.createApp();
+    assert.strictEqual(typeof a, 'function');
+    assert.strictEqual(typeof a.use, 'function', 'app has .use()');
+    assert.strictEqual(typeof a.get, 'function', 'app has .get()');
+    assert.notStrictEqual(a, b, 'each call returns a distinct app instance');
+  });
+
+  it('loadConfiguration: defaults to 127.0.0.1:3000 when no env is set', () => {
+    const savedHost = process.env.HOST;
+    const savedPort = process.env.PORT;
+    delete process.env.HOST;
+    delete process.env.PORT;
+    try {
+      assert.deepStrictEqual(srv.loadConfiguration(), { hostname: '127.0.0.1', port: 3000 });
+    } finally {
+      if (savedHost === undefined) delete process.env.HOST;
+      else process.env.HOST = savedHost;
+      if (savedPort === undefined) delete process.env.PORT;
+      else process.env.PORT = savedPort;
+    }
+  });
+
+  it('loadConfiguration: honors valid HOST/PORT overrides', () => {
+    const savedHost = process.env.HOST;
+    const savedPort = process.env.PORT;
+    process.env.HOST = '0.0.0.0';
+    process.env.PORT = '8080';
+    try {
+      assert.deepStrictEqual(srv.loadConfiguration(), { hostname: '0.0.0.0', port: 8080 });
+    } finally {
+      if (savedHost === undefined) delete process.env.HOST;
+      else process.env.HOST = savedHost;
+      if (savedPort === undefined) delete process.env.PORT;
+      else process.env.PORT = savedPort;
+    }
+  });
+
+  it('describeError: single-line, sanitized, no stack by default', () => {
     const e = new Error('oops\nsecond\r\ntab\there\u0007bell');
     e.code = 'ETEST';
     const s = srv.describeError(e);
@@ -1033,7 +1041,7 @@ describe('unit: exported handlers and helpers', () => {
     }
   });
 
-  it('formatAuthority: brackets IPv6, leaves IPv4/hostname verbatim (SRV-FINAL-04)', () => {
+  it('formatAuthority: brackets IPv6, leaves IPv4/hostname verbatim', () => {
     assert.strictEqual(srv.formatAuthority('127.0.0.1', 3000), '127.0.0.1:3000');
     assert.strictEqual(srv.formatAuthority('0.0.0.0', 8080), '0.0.0.0:8080');
     assert.strictEqual(srv.formatAuthority('localhost', 80), 'localhost:80');
@@ -1041,7 +1049,7 @@ describe('unit: exported handlers and helpers', () => {
     assert.strictEqual(srv.formatAuthority('fe80::1', 3000), '[fe80::1]:3000');
   });
 
-  it('handleConnect: one 405 + Allow, then closes the socket (SRV-FINAL-01)', () => {
+  it('handleConnect: one 405 + Allow, then closes the socket', () => {
     const socket = {
       writable: true, destroyed: false, written: '', ended: false,
       write(d) { this.written += d; return true; },
@@ -1062,64 +1070,67 @@ describe('unit: exported handlers and helpers', () => {
     assert.ok(dead.destroyed);
   });
 
-  it('handleRequest: an injected request-setup failure becomes a single 500 (SRV-FINAL-03)', () => {
+  it('errorHandler: an unexpected route throw becomes a single generic 500 (no detail leak)', { timeout: TEST_TIMEOUT_MS }, async () => {
+    // Build a tiny app whose route deliberately throws, wired to the EXPORTED
+    // error handler, and confirm the generic-500 contract end-to-end without a
+    // detail leak. This exercises the real 500 path that a correct server never
+    // reaches over the wire.
+    const express = require('express');
+    const boomApp = express();
+    boomApp.disable('x-powered-by');
+    boomApp.get('/boom', () => {
+      throw new Error('boom-internal-detail');
+    });
+    boomApp.use(srv.errorHandler);
+    const boomServer = http.createServer(boomApp);
     const origErr = console.error;
     const logs = [];
     console.error = (m) => logs.push(String(m));
-    let res;
     try {
-      const req = { method: 'GET', url: '/', socket: {}, on() { throw new Error('injected setup failure'); } };
-      res = makeMockRes();
-      srv.handleRequest(req, res); // must NOT throw
+      await new Promise((resolve) => boomServer.listen(0, TEST_HOST, resolve));
+      const { port } = boomServer.address();
+      const res = await httpRequest({ port, method: 'GET', path: '/boom' });
+      assert.strictEqual(res.statusCode, 500, 'a route throw must produce a 500');
+      assert.strictEqual(res.body, 'Internal Server Error');
+      assert.ok(!res.body.includes('boom-internal-detail'), 'must not leak internal error detail to the client');
     } finally {
       console.error = origErr;
+      await new Promise((resolve) => boomServer.close(resolve));
     }
-    assert.strictEqual(res.statusCode, 500, 'a setup-time failure must produce a generic 500');
-    assert.strictEqual(res.body, 'Internal Server Error');
     assert.ok(logs.length >= 1, 'the 500 must be logged');
     assert.ok(logs.every((l) => !l.includes('\n')), 'the 500 log must be single-line by default');
   });
 
-  it('handleRequest: a throw during routing becomes a single 500, no duplicate on re-emit', () => {
-    const { EventEmitter } = require('events');
-    const origErr = console.error;
-    console.error = () => {};
+  it('createAndConfigureServer: serves both endpoints and validation in-process (integration)', { timeout: TEST_TIMEOUT_MS }, async () => {
+    const server = srv.createAndConfigureServer();
     try {
-      const req = new EventEmitter();
-      req.socket = {}; req.destroyed = false; req.complete = true; req.url = '/';
-      Object.defineProperty(req, 'method', { get() { throw new Error('injected route failure'); } });
-      const res = makeMockRes();
-      srv.handleRequest(req, res);
-      req.emit('end');
-      assert.strictEqual(res.statusCode, 500, 'a routing throw must produce a 500');
-      res.statusCode = 'UNCHANGED';
-      req.emit('end'); // finalize is idempotent -> no second response
-      assert.strictEqual(res.statusCode, 'UNCHANGED', 'no duplicate response on re-emit');
+      await new Promise((resolve) => server.listen(0, TEST_HOST, resolve));
+      const { port } = server.address();
+
+      const hello = await httpRequest({ port, method: 'GET', path: '/' });
+      assert.strictEqual(hello.statusCode, 200);
+      assert.strictEqual(hello.body, 'Hello, World!\n');
+
+      const gm = await httpRequest({ port, method: 'GET', path: '/good-morning' });
+      assert.strictEqual(gm.statusCode, 200);
+      assert.strictEqual(gm.body, 'Good morning\n');
+
+      const notFound = await httpRequest({ port, method: 'GET', path: '/nope' });
+      assert.strictEqual(notFound.statusCode, 404);
+      assert.strictEqual(notFound.body, 'Not Found');
+
+      const notAllowed = await httpRequest({ port, method: 'DELETE', path: '/' });
+      assert.strictEqual(notAllowed.statusCode, 405);
+      assert.strictEqual(notAllowed.headers['allow'], 'GET, HEAD');
+
+      const tooLarge = await httpRequest({ port, method: 'POST', path: '/', body: Buffer.alloc(MAX_BODY_SIZE + 1, 0x61) });
+      assert.strictEqual(tooLarge.statusCode, 413);
     } finally {
-      console.error = origErr;
+      await new Promise((resolve) => server.close(resolve));
     }
   });
 
-  it('routeRequest: preserves the exact GET / and HEAD / contract', () => {
-    const collect = (res) => (s, h, b) => { res.writeHead(s, h); res.end(b); };
-    const r1 = makeMockRes();
-    srv.routeRequest({ method: 'GET', url: '/' }, r1, collect(r1));
-    assert.strictEqual(r1.statusCode, 200);
-    assert.strictEqual(r1.sentHeaders['Content-Type'], 'text/plain');
-    assert.strictEqual(r1.body, 'Hello, World!\n');
-
-    const r2 = makeMockRes();
-    srv.routeRequest({ method: 'HEAD', url: '/' }, r2, collect(r2));
-    assert.strictEqual(r2.statusCode, 200);
-    assert.strictEqual(r2.body, null, 'HEAD carries no body');
-
-    const r3 = makeMockRes();
-    srv.routeRequest({ method: 'PATCH', url: '/' }, r3, collect(r3));
-    assert.strictEqual(r3.statusCode, 405);
-    assert.strictEqual(r3.sentHeaders.Allow, 'GET, HEAD');
-  });
-
-  it('buildChildEnv: forwards only allowlisted vars, never secrets or NODE_OPTIONS (TST-FINAL-05)', () => {
+  it('buildChildEnv: forwards only allowlisted vars, never secrets or NODE_OPTIONS', () => {
     const savedSecret = process.env.BLITZY_FAKE_SECRET;
     const savedNodeOpts = process.env.NODE_OPTIONS;
     process.env.BLITZY_FAKE_SECRET = 'super-secret-value';
@@ -1146,21 +1157,3 @@ describe('unit: exported handlers and helpers', () => {
     }
   });
 });
-
-// ---------------------------------------------------------------------------
-// Shared mock ServerResponse for the in-process unit tests.
-// ---------------------------------------------------------------------------
-function makeMockRes() {
-  return {
-    _headersSent: false, _writableEnded: false, _destroyed: false,
-    statusCode: null, sentHeaders: null, body: null,
-    get headersSent() { return this._headersSent; },
-    get writableEnded() { return this._writableEnded; },
-    get destroyed() { return this._destroyed; },
-    writeHead(s, h) { this._headersSent = true; this.statusCode = s; this.sentHeaders = h; return this; },
-    end(b) { this._writableEnded = true; if (b !== undefined) this.body = b; },
-    destroy() { this._destroyed = true; },
-    on() { return this; },
-    socket: {},
-  };
-}
